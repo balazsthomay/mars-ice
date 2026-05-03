@@ -570,6 +570,14 @@ SWIM_SHALLOW_DEPTH_KEYS = [
     "swim2_c_1_5m",
 ]
 
+# SWIM 5m+ ice-consistency channels — published expert assessment of deep ice
+# down to ~hundreds of meters where SHARAD reflectors and geomorphic evidence
+# constrain it. Same merging logic as the shallow target.
+SWIM_DEEP_DEPTH_KEYS = [
+    "swim4mim_ci_5m",
+    "swim2_c_5m",
+]
+
 
 def _spatial_blocks(lat: "np.ndarray", lon: "np.ndarray", n_lat: int = 6, n_lon: int = 6) -> "np.ndarray":
     """Assign each point to a coarse lat/lon block id. Blocks are kept whole during CV."""
@@ -1122,6 +1130,215 @@ def swim_main():
     print(json.dumps(res2, indent=2))
 
 
+@app.function(image=image, volumes={DATA_DIR: volume}, timeout=1800, memory=8192)
+def train_swim_soft_deep(
+    n_samples: int = 300_000,
+    n_seeds: int = 5,
+    val_holdout_blocks: int = 6,
+) -> dict:
+    """Mirror of train_swim_soft_shallow but targeting SWIM_DEEP_DEPTH_KEYS (5 m+).
+
+    No hard-label validation — we don't have deep hard labels yet (Stuurman/Petersen
+    are paywalled; Bramson PDF on disk needs manual table extraction). Once those
+    land, add a deep-label parquet and validate here.
+    """
+    import pickle
+    import time
+
+    import numpy as np
+    from lightgbm import LGBMRegressor
+    from sklearn.metrics import mean_absolute_error, roc_auc_score
+
+    rng = np.random.default_rng(42)
+
+    t0 = time.time()
+    arr_lazy = np.load(pathlib.Path(PROCESSED) / "feature_stack.npz")
+    arrs = {k: np.asarray(arr_lazy[k]) for k in (FEATURE_COLS_NONSWIM + SWIM_DEEP_DEPTH_KEYS)}
+
+    swim_layers = [arrs[k] for k in SWIM_DEEP_DEPTH_KEYS]
+    H, W = swim_layers[0].shape
+
+    target = np.full((H, W), np.nan, dtype="float32")
+    coverage = np.zeros((H, W), dtype=bool)
+    for layer in swim_layers:
+        valid = np.isfinite(layer)
+        clipped = np.clip(layer, 0.0, 1.0)
+        target_now = np.where(valid, np.where(np.isnan(target), clipped, np.maximum(target, clipped)), target)
+        target = target_now
+        coverage |= valid
+
+    n_coverage = int(coverage.sum())
+    target_stats = {
+        "coverage_pixels": n_coverage,
+        "coverage_fraction": round(n_coverage / (H * W), 4),
+        "target_min": float(target[coverage].min()),
+        "target_p10": float(np.percentile(target[coverage], 10)),
+        "target_p50": float(np.percentile(target[coverage], 50)),
+        "target_p90": float(np.percentile(target[coverage], 90)),
+        "target_max": float(target[coverage].max()),
+        "target_mean": float(target[coverage].mean()),
+    }
+    print(f"SWIM deep target stats: {target_stats}")
+
+    X_full = np.stack([arrs[k].reshape(-1) for k in FEATURE_COLS_NONSWIM], axis=1).astype("float32")
+    y_full = target.reshape(-1)
+    coverage_flat = coverage.reshape(-1)
+
+    coverage_idx = np.where(coverage_flat)[0]
+    sample_size = min(n_samples, len(coverage_idx))
+    sample_idx = rng.choice(coverage_idx, size=sample_size, replace=False)
+
+    X = X_full[sample_idx]
+    y_soft = y_full[sample_idx]
+
+    sample_rows = sample_idx // W
+    sample_cols = sample_idx % W
+    sample_lat = 90.0 - (sample_rows + 0.5) * 180.0 / H
+    sample_lon = (sample_cols + 0.5) * 360.0 / W
+    blocks = _spatial_blocks(sample_lat, sample_lon, n_lat=6, n_lon=6)
+    unique_blocks = np.unique(blocks)
+    n_val = min(val_holdout_blocks, max(1, len(unique_blocks) // 4))
+    val_blocks_chosen = rng.choice(unique_blocks, size=n_val, replace=False)
+    val_mask = np.isin(blocks, val_blocks_chosen)
+    train_mask = ~val_mask
+
+    print(
+        f"Train: {train_mask.sum():,} samples in {len(unique_blocks)-n_val} blocks; "
+        f"Val: {val_mask.sum():,} samples in {n_val} held-out blocks"
+    )
+
+    models = []
+    for seed in range(n_seeds):
+        regr = LGBMRegressor(
+            objective="cross_entropy",
+            n_estimators=500,
+            learning_rate=0.04,
+            num_leaves=31,
+            min_data_in_leaf=64,
+            reg_lambda=0.5,
+            random_state=seed,
+            bagging_fraction=0.8,
+            bagging_freq=1,
+            feature_fraction=0.85,
+            verbose=-1,
+        )
+        regr.fit(X[train_mask], y_soft[train_mask])
+        models.append(regr)
+
+    preds_val = np.mean([m.predict(X[val_mask]) for m in models], axis=0)
+    preds_val = np.clip(preds_val, 0.0, 1.0)
+    val_mae = float(mean_absolute_error(y_soft[val_mask], preds_val))
+    val_brier_soft = float(((preds_val - y_soft[val_mask]) ** 2).mean())
+    y_val_bin = (y_soft[val_mask] >= 0.5).astype("int64")
+    if 0 < y_val_bin.sum() < len(y_val_bin):
+        val_auc = float(roc_auc_score(y_val_bin, preds_val))
+    else:
+        val_auc = float("nan")
+
+    artifact = {
+        "models": models,
+        "feature_cols": FEATURE_COLS_NONSWIM,
+        "swim_target_keys": SWIM_DEEP_DEPTH_KEYS,
+        "n_samples_train": int(train_mask.sum()),
+        "n_samples_val": int(val_mask.sum()),
+        "n_seeds": n_seeds,
+    }
+    out_path = pathlib.Path(PROCESSED) / "model_swim_deep.pkl"
+    with open(out_path, "wb") as f:
+        pickle.dump(artifact, f)
+    volume.commit()
+
+    return {
+        "model_path": str(out_path),
+        "size_mb": round(out_path.stat().st_size / 1024 / 1024, 2),
+        "elapsed_s": round(time.time() - t0, 1),
+        "target_stats": target_stats,
+        "swim_holdout": {
+            "mae": round(val_mae, 4),
+            "brier_soft": round(val_brier_soft, 4),
+            "auc_at_0.5_threshold": round(val_auc, 4),
+            "n_train": int(train_mask.sum()),
+            "n_val": int(val_mask.sum()),
+            "n_held_out_blocks": int(n_val),
+        },
+        "feature_importances_mean_gain": {
+            k: round(float(np.mean([m.booster_.feature_importance("gain")[i] for m in models])), 1)
+            for i, k in enumerate(FEATURE_COLS_NONSWIM)
+        },
+    }
+
+
+@app.function(image=image, volumes={DATA_DIR: volume}, timeout=1200, memory=8192)
+def infer_global_swim_soft_deep() -> dict:
+    """Predict deep ice probability + ensemble-spread uncertainty using the deep model."""
+    import pickle
+    import time
+
+    import numpy as np
+
+    t0 = time.time()
+    arr_lazy = np.load(pathlib.Path(PROCESSED) / "feature_stack.npz")
+    arrs = {k: np.asarray(arr_lazy[k]) for k in FEATURE_COLS_NONSWIM}
+    H, W = arrs[FEATURE_COLS_NONSWIM[0]].shape
+    X = np.stack([arrs[k].reshape(-1) for k in FEATURE_COLS_NONSWIM], axis=1).astype("float32")
+
+    with open(pathlib.Path(PROCESSED) / "model_swim_deep.pkl", "rb") as f:
+        artifact = pickle.load(f)
+
+    preds = []
+    for m in artifact["models"]:
+        p = np.clip(m.predict(X), 0.0, 1.0).astype("float32")
+        preds.append(p)
+    preds = np.stack(preds, axis=0)
+    p_mean = preds.mean(axis=0).reshape(H, W)
+    p_std = preds.std(axis=0).reshape(H, W)
+
+    p99 = float(np.percentile(p_std, 99))
+    ceiling = max(p99, 0.02)
+    uncertainty = np.clip(p_std / ceiling, 0.0, 1.0).astype("float32")
+
+    out_path = pathlib.Path(PROCESSED) / "swim_deep_inference.npz"
+    np.savez_compressed(
+        out_path,
+        probability=p_mean.astype("float32"),
+        ensemble_std=p_std.astype("float32"),
+        uncertainty=uncertainty,
+    )
+    volume.commit()
+
+    valid = np.isfinite(p_mean)
+    return {
+        "out_path": str(out_path),
+        "size_mb": round(out_path.stat().st_size / 1024 / 1024, 2),
+        "shape": [H, W],
+        "elapsed_s": round(time.time() - t0, 1),
+        "prob_stats": {
+            "mean": float(p_mean[valid].mean()),
+            "p10": float(np.percentile(p_mean[valid], 10)),
+            "p50": float(np.percentile(p_mean[valid], 50)),
+            "p90": float(np.percentile(p_mean[valid], 90)),
+            "frac_above_0.5": float((p_mean[valid] > 0.5).mean()),
+            "frac_above_0.8": float((p_mean[valid] > 0.8).mean()),
+        },
+        "ensemble_std_stats": {
+            "median": float(np.median(p_std)),
+            "p90": float(np.percentile(p_std, 90)),
+            "max": float(p_std.max()),
+        },
+    }
+
+
+@app.local_entrypoint()
+def swim_deep_main():
+    import json
+    print("=== Train SWIM-soft-label deep model (5 m+) ===")
+    res = train_swim_soft_deep.remote()
+    print(json.dumps(res, indent=2))
+    print("\n=== Global deep inference ===")
+    res2 = infer_global_swim_soft_deep.remote()
+    print(json.dumps(res2, indent=2))
+
+
 @app.function(image=image, volumes={DATA_DIR: volume}, timeout=300)
 def validate_swim_on_hard_labels() -> dict:
     """Run the deployed SWIM-soft model against the (now Daubar-enriched) hard label set.
@@ -1283,10 +1500,21 @@ def export_tiles(source: str = "swim") -> dict:
 
     if source == "swim":
         inf_path = pathlib.Path(PROCESSED) / "swim_shallow_inference.npz"
+        prefix = "shallow"
+        depth_label = "shallow_0_5m"
+        depth_min, depth_max = 0, 5
+    elif source == "swim_deep":
+        inf_path = pathlib.Path(PROCESSED) / "swim_deep_inference.npz"
+        prefix = "deep"
+        depth_label = "deep_5m_plus"
+        depth_min, depth_max = 5, 500
     elif source == "v1":
         inf_path = pathlib.Path(PROCESSED) / "shallow_inference.npz"
+        prefix = "shallow"
+        depth_label = "shallow_0_5m"
+        depth_min, depth_max = 0, 5
     else:
-        raise ValueError(f"unknown source {source!r}; expected 'swim' or 'v1'")
+        raise ValueError(f"unknown source {source!r}; expected 'swim', 'swim_deep', or 'v1'")
     inf = np.load(inf_path)
     prob = inf["probability"]  # 0..1, may have NaN at unsupported cells (none currently)
     unc = inf["uncertainty"]   # 0..1
@@ -1349,18 +1577,20 @@ def export_tiles(source: str = "swim") -> dict:
     paths: dict[str, str] = {}
     t0 = time.time()
     for name, arr in [
-        ("shallow_probability_rgba.png", prob_rgba),
-        ("shallow_uncertainty_rgba.png", unc_rgba),
-        ("shallow_probability_8bit.png", prob_q),
-        ("shallow_uncertainty_8bit.png", unc_q),
+        (f"{prefix}_probability_rgba.png", prob_rgba),
+        (f"{prefix}_uncertainty_rgba.png", unc_rgba),
+        (f"{prefix}_probability_8bit.png", prob_q),
+        (f"{prefix}_uncertainty_8bit.png", unc_q),
     ]:
         p = out_dir / name
         Image.fromarray(arr).save(p, optimize=True)
         paths[name] = str(p)
 
+    # Per-depth manifest fragment. Frontend can read both shallow and deep manifests
+    # to know what depth bin each tile set represents.
     manifest = {
         "version": "v1",
-        "depth_bins": {"shallow_0_5m": {"min_m": 0, "max_m": 5}},
+        "depth_bin": {depth_label: {"min_m": depth_min, "max_m": depth_max}},
         "crs": TARGET_CRS,
         "shape": [H, W],
         "bounds_lonlat": [-180.0, -90.0, 180.0, 90.0],
@@ -1370,12 +1600,13 @@ def export_tiles(source: str = "swim") -> dict:
             "8bit": "uint8 single channel, value = (probability or uncertainty) * 255, 0 if no data",
         },
         "model": {
-            "name": "mars-ice shallow",
+            "name": f"mars-ice {prefix}",
             "source": source,
         },
     }
-    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
-    paths["manifest.json"] = str(out_dir / "manifest.json")
+    manifest_name = "manifest.json" if prefix == "shallow" else f"manifest_{prefix}.json"
+    (out_dir / manifest_name).write_text(json.dumps(manifest, indent=2))
+    paths[manifest_name] = str(out_dir / manifest_name)
 
     volume.commit()
     sizes = {pathlib.Path(p).name: round(pathlib.Path(p).stat().st_size / 1024 / 1024, 3) for p in paths.values()}
@@ -1438,23 +1669,34 @@ def export_main():
 
 
 @app.local_entrypoint()
-def fetch_tiles(out_dir: str = "tiles_local"):
+def fetch_tiles(out_dir: str = "tiles_local", include_deep: bool = True):
     """Download the exported tiles to a local directory for preview."""
-    import json
     import pathlib as plib
 
     target = plib.Path(out_dir)
     target.mkdir(parents=True, exist_ok=True)
-    for name in [
+    names = [
         "shallow_probability_rgba.png",
         "shallow_uncertainty_rgba.png",
         "shallow_probability_8bit.png",
         "shallow_uncertainty_8bit.png",
         "manifest.json",
-    ]:
-        b = get_tile_bytes.remote(name)
-        (target / name).write_bytes(b)
-        print(f"  {name}: {len(b)} bytes -> {target / name}")
+    ]
+    if include_deep:
+        names += [
+            "deep_probability_rgba.png",
+            "deep_uncertainty_rgba.png",
+            "deep_probability_8bit.png",
+            "deep_uncertainty_8bit.png",
+            "manifest_deep.json",
+        ]
+    for name in names:
+        try:
+            b = get_tile_bytes.remote(name)
+            (target / name).write_bytes(b)
+            print(f"  {name}: {len(b)} bytes -> {target / name}")
+        except Exception as e:
+            print(f"  SKIP {name}: {str(e)[:120]}")
 
 
 @app.local_entrypoint()

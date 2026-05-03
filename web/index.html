@@ -139,13 +139,16 @@
 
   <div class="panel" id="footer">
     LightGBM ensemble (5 seeds) trained on <b>~225,000</b> SWIM ice-consistency
-    cells as soft labels, predicting from MOLA topography + areoid and Odyssey
-    Neutron Spectrometer (epi/thermal/fast). Validation:
-    spatially-held-out SWIM blocks <b>AUC 0.87</b>; against the 177 hand-curated
-    + Dundas hard labels <b>AUC 0.85, Brier 0.20</b>.
+    cells as soft labels, predicting from MOLA topography and Odyssey Neutron
+    Spectrometer (epi/thermal/fast). Mars areoid dropped after a sanity check
+    showed it carried partial latitude correlation. Validation against
+    <b>1,356 globally distributed hard labels</b> (Dundas crater scarps + Daubar
+    new impacts + 7 in-situ landers) gives <b>AUC 0.93, Brier 0.08</b>; on the 996
+    tropical sites Daubar found dry, <b>Brier 0.04</b> — the model correctly
+    predicts low ice probability there even though those craters are not in training.
     Uncertainty = ensemble disagreement only — no proximity-to-label term, so
     "uncertain" means the model itself is unsure, not just that no rover went there.
-    <br /><code>v2 shallow</code> · 0–5&thinsp;m only · SHARAD reflectors deferred to deep model.
+    <br /><code>v2.1 shallow</code> · 0–5&thinsp;m only · SHARAD reflectors deferred to deep model.
   </div>
 
 <script>

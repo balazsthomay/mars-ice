@@ -23,6 +23,9 @@ image = modal.Image.debian_slim(python_version="3.12").pip_install(
     "pdr>=1.4",
     "lightgbm>=4.5",
     "scikit-learn>=1.5",
+    "openpyxl>=3.1",
+    "pdfplumber>=0.11",
+    "fastexcel>=0.12",
 )
 
 volume = modal.Volume.from_name("mars-ice-data", create_if_missing=True)
@@ -306,6 +309,28 @@ MANIFEST: list[LayerSpec] = [
         "labels/mcglasson_2024",
         filename_override="mcglasson_2024_bundle.tar",
     ),
+    # --- Deep ice catalogs (>5 m) ---
+    # Daubar et al. 2022 — 1,203 dated impacts; ~6% expose subsurface ice with depth-of-excavation.
+    # Zenodo deposit (CC-BY 4.0), single Excel file with the master catalog.
+    LayerSpec(
+        "daubar_2022_table",
+        "https://zenodo.org/records/6604912/files/Daubar_2022_catalog_tableS1.xlsx",
+        "labels/daubar_2022",
+        filename_override="daubar_2022_tableS1.xlsx",
+    ),
+    # Bramson et al. 2015 GRL — Arcadia Planitia SHARAD + terraced craters. arXiv preprint is
+    # auth-free; same content as the paywalled Wiley version.
+    LayerSpec(
+        "bramson_2015_pdf",
+        "https://arxiv.org/pdf/1509.03210",
+        "labels/bramson_2015",
+        filename_override="bramson_2015.pdf",
+    ),
+    # Stuurman 2016 (Utopia Planitia SHARAD) and Petersen 2018 (Deuteronilus LDAs) deliberately
+    # NOT included — Wiley blocks programmatic PDF access and no open mirrors exist. We refuse
+    # to fabricate them as bounding boxes (would repeat the v1 "model thinks ice = looks like
+    # the cluster I trained on" failure mode). If we want them later: manual coordinate
+    # transcription from LPSC abstracts, or shipping a curated JSON of pick centroids.
 ]
 
 
@@ -437,6 +462,61 @@ def inspect_labels_main():
     print(json.dumps(inspect_label_sources.remote(), indent=2, default=str))
 
 
+@app.function(image=image, volumes={DATA_DIR: volume}, timeout=300)
+def inspect_deep_label_sources() -> dict:
+    """Peek at Daubar 2022 Excel and Bramson 2015 PDF contents."""
+    import polars as pl
+    import pdfplumber
+
+    out: dict = {}
+
+    # Daubar 2022 — Excel with crater catalog. Convert to dict by reading sheets.
+    daubar_path = pathlib.Path(RAW) / "labels/daubar_2022/daubar_2022_tableS1.xlsx"
+    out["daubar_2022"] = {"path": str(daubar_path), "size_kb": round(daubar_path.stat().st_size / 1024, 1)}
+    try:
+        # polars can read xlsx via openpyxl as engine
+        df = pl.read_excel(daubar_path)
+        ice_col = "Ice-exposing impact"
+        out["daubar_2022"]["sheet_default"] = {
+            "rows": df.height,
+            "columns": df.columns[:30],
+            "head": df.head(3).to_dicts(),
+            "ice_unique": df[ice_col].value_counts().sort("count", descending=True).to_dicts() if ice_col in df.columns else None,
+        }
+    except Exception as e:
+        out["daubar_2022"]["error"] = str(e)[:300]
+
+    # Bramson 2015 — PDF, look for table-like content. List pages, extract text from candidate pages.
+    bramson_path = pathlib.Path(RAW) / "labels/bramson_2015/bramson_2015.pdf"
+    out["bramson_2015"] = {"path": str(bramson_path), "size_kb": round(bramson_path.stat().st_size / 1024, 1)}
+    try:
+        with pdfplumber.open(bramson_path) as pdf:
+            out["bramson_2015"]["n_pages"] = len(pdf.pages)
+            page_summaries = []
+            for i, page in enumerate(pdf.pages):
+                tables = page.extract_tables()
+                text = (page.extract_text() or "")
+                head = text[:300].replace("\n", " | ")
+                page_summaries.append({
+                    "page": i + 1,
+                    "has_tables": bool(tables),
+                    "table_dims": [(len(t), len(t[0]) if t else 0) for t in tables],
+                    "text_head": head,
+                    "text_len": len(text),
+                })
+            out["bramson_2015"]["pages"] = page_summaries
+    except Exception as e:
+        out["bramson_2015"]["error"] = str(e)[:300]
+
+    return out
+
+
+@app.local_entrypoint()
+def inspect_deep_main():
+    import json
+    print(json.dumps(inspect_deep_label_sources.remote(), indent=2, default=str))
+
+
 @app.function(image=image, volumes={DATA_DIR: volume}, timeout=120)
 def file_magic(rel_path: str, n_bytes: int = 512) -> dict:
     """Read first N bytes of a file under raw/ to identify format."""
@@ -478,7 +558,6 @@ FEATURE_COLS_SHALLOW = [
 # label. These are the non-SWIM features used by the SWIM-soft-label model.
 FEATURE_COLS_NONSWIM = [
     "mola_topography_m",
-    "mola_areoid_m",
     "ns_epithermal_cps",
     "ns_thermal_cps",
     "ns_fast_cps",
@@ -1041,6 +1120,92 @@ def swim_main():
     print("\n=== Global inference (SWIM model, ensemble-std uncertainty only) ===")
     res2 = infer_global_swim_soft.remote()
     print(json.dumps(res2, indent=2))
+
+
+@app.function(image=image, volumes={DATA_DIR: volume}, timeout=300)
+def validate_swim_on_hard_labels() -> dict:
+    """Run the deployed SWIM-soft model against the (now Daubar-enriched) hard label set.
+
+    Reports overall AUC/Brier and per-catalog breakdowns so we can see whether the
+    model generalizes outside the original 177-label cluster.
+    """
+    import pickle
+
+    import numpy as np
+    import polars as pl
+    from sklearn.metrics import brier_score_loss, roc_auc_score
+
+    with open(pathlib.Path(PROCESSED) / "model_swim_shallow.pkl", "rb") as f:
+        artifact = pickle.load(f)
+    models = artifact["models"]
+    feature_cols = artifact["feature_cols"]
+
+    df = pl.read_parquet(pathlib.Path(PROCESSED) / "labels_shallow_with_features.parquet")
+    df = df.filter(pl.col("weight") >= 0.5)
+
+    # Drop rows where any required feature is NaN — labels at very high latitudes can fall
+    # outside Odyssey NS coverage.
+    feat_cols_present = [c for c in feature_cols if c in df.columns]
+    if len(feat_cols_present) != len(feature_cols):
+        return {"error": f"missing features: {set(feature_cols) - set(feat_cols_present)}"}
+
+    valid_mask = df.select(
+        [pl.col(c).is_finite() & pl.col(c).is_not_null() for c in feature_cols]
+    ).to_numpy().all(axis=1)
+    df = df.filter(pl.Series(valid_mask))
+
+    X = df.select(feature_cols).to_numpy()
+    y = df["label"].to_numpy().astype("int64")
+    preds = np.clip(np.mean([m.predict(X) for m in models], axis=0), 0.0, 1.0)
+
+    def _metrics(mask: np.ndarray) -> dict:
+        y_sub = y[mask]
+        p_sub = preds[mask]
+        n = int(mask.sum())
+        if n == 0:
+            return {"n": 0, "n_pos": 0, "auc": None, "brier": None}
+        # Brier is well-defined whenever we have any samples — even single-class.
+        brier = round(float(((p_sub - y_sub) ** 2).mean()), 4)
+        if 0 < y_sub.sum() < n:
+            auc = round(float(roc_auc_score(y_sub, p_sub)), 4)
+        else:
+            auc = None
+        return {"n": n, "n_pos": int(y_sub.sum()), "auc": auc, "brier": brier}
+
+    overall = _metrics(np.ones(len(y), dtype=bool))
+
+    # Per-catalog breakdown: catalog name = first whitespace-separated token of source string
+    catalog = df.with_columns(pl.col("source").str.split(" ").list.first().alias("cat"))["cat"].to_numpy()
+    by_catalog: dict[str, dict] = {}
+    for c in sorted(set(catalog)):
+        by_catalog[c] = _metrics(catalog == c)
+
+    # Hemisphere & latitude-band breakdown — was the latitude proxy actually doing real work?
+    lat = df["lat"].to_numpy()
+    hemis = {
+        "north_>60N": _metrics(lat > 60.0),
+        "north_30_60N": _metrics((lat > 30.0) & (lat <= 60.0)),
+        "tropics_30S_30N": _metrics(np.abs(lat) <= 30.0),
+        "south_30_60S": _metrics((lat < -30.0) & (lat >= -60.0)),
+        "south_<60S": _metrics(lat < -60.0),
+    }
+
+    return {
+        "feature_cols": feature_cols,
+        "n_total": int(len(y)),
+        "n_pos": int(y.sum()),
+        "n_neg": int(len(y) - y.sum()),
+        "overall": overall,
+        "by_catalog": by_catalog,
+        "by_latitude_band": hemis,
+    }
+
+
+@app.local_entrypoint()
+def validate_main():
+    import json
+    res = validate_swim_on_hard_labels.remote()
+    print(json.dumps(res, indent=2))
 
 
 @app.function(image=image, volumes={DATA_DIR: volume}, timeout=120)
@@ -1785,6 +1950,67 @@ def _parse_dundas_2021(label_root: pathlib.Path) -> "pl.DataFrame":
     return pl.DataFrame(rows)
 
 
+def _parse_daubar_2022(label_root: pathlib.Path) -> "pl.DataFrame":
+    """Daubar 2022 catalog of dated impacts → globally distributed hard shallow labels.
+
+    1,203 craters with surface morphology assessed for ice exposure. We turn the
+    Ice-exposing impact column into binary labels, using crater diameter as a rough
+    proxy for excavation depth (~0.1 × diameter). Most craters are <30 m diameter, so
+    excavation reaches ~3 m — appropriate ground truth for the shallow (0–5 m) model.
+    """
+    import polars as pl
+
+    xlsx = label_root / "daubar_2022/daubar_2022_tableS1.xlsx"
+    if not xlsx.exists():
+        return pl.DataFrame()
+
+    df = pl.read_excel(xlsx)
+    # Column names in the upstream sheet are slightly mislabeled — values are correct.
+    lat_col = "Latitude (deg E, centric)"
+    lon_col = "Longitude (deg N)"
+    ice_col = "Ice-exposing impact"
+    diam_col = "Diameter (m)"
+
+    rows: list[dict] = []
+    for r in df.iter_rows(named=True):
+        try:
+            lat = float(r[lat_col])
+            lon = float(r[lon_col]) % 360.0
+            diam = float(r[diam_col]) if r[diam_col] is not None else None
+        except (TypeError, ValueError):
+            continue
+        ice_raw = (r[ice_col] or "").strip().lower()
+        # Excavation depth ≈ 0.1 × diameter; cap at 5 m so this stays a shallow-model label
+        if diam is None:
+            depth_m = 1.0
+        else:
+            depth_m = max(0.1, min(5.0, 0.1 * diam))
+
+        if ice_raw == "y":
+            label, weight = 1.0, 1.0
+        elif ice_raw == "possible":
+            label, weight = 1.0, 0.4
+        elif ice_raw == "n":
+            # "no ice exposed" is strong evidence of no ice within the excavation depth.
+            # Weight slightly below 1.0 because the crater might just have missed an ice patch.
+            label, weight = 0.0, 0.7
+        else:
+            continue
+
+        rows.append({
+            "name": f"daubar_2022_{r['HiRISE Observation ID']}",
+            "lat": lat,
+            "lon": lon,
+            "label": label,
+            "weight": weight,
+            "depth_m": depth_m,
+            "source": f"Daubar 2022 (ice={ice_raw}, diam={diam:.1f} m)" if diam else f"Daubar 2022 (ice={ice_raw})",
+            "evidence": "fresh_impact_crater",
+        })
+
+    return pl.DataFrame(rows) if rows else pl.DataFrame()
+
+
 @app.function(image=image, volumes={DATA_DIR: volume}, timeout=300)
 def build_labels(extra_shallow_csv: str | None = None, extra_deep_csv: str | None = None) -> dict:
     """Assemble shallow + deep label tables. Output: two parquet files in processed/."""
@@ -1804,6 +2030,9 @@ def build_labels(extra_shallow_csv: str | None = None, extra_deep_csv: str | Non
     dundas_df = _parse_dundas_2021(label_root)
     if not dundas_df.is_empty():
         sources.append(dundas_df)
+    daubar_df = _parse_daubar_2022(label_root)
+    if not daubar_df.is_empty():
+        sources.append(daubar_df)
 
     shallow = pl.concat(sources, how="diagonal_relaxed")
     deep = pl.DataFrame(schema=gt_df.schema)
@@ -1824,7 +2053,12 @@ def build_labels(extra_shallow_csv: str | None = None, extra_deep_csv: str | Non
         "shallow_pos_high_conf": int(pos_strict),
         "shallow_neg_high_conf": int(neg_strict),
         "shallow_lat_range": [float(shallow["lat"].min()), float(shallow["lat"].max())],
-        "by_source": dict(shallow.group_by("source").agg(pl.len().alias("n")).iter_rows()),
+        "by_catalog": dict(
+            shallow.with_columns(pl.col("source").str.split(" ").list.first().alias("catalog"))
+            .group_by("catalog")
+            .agg(pl.len().alias("n"))
+            .iter_rows()
+        ),
     }
 
 

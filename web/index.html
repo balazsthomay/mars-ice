@@ -408,7 +408,10 @@ function buildLayers() {
       image: predCanvas,
       opacity: 1,
       _imageCoordinateSystem: COORDINATE_SYSTEM.LNGLAT,
-      parameters: { depthCompare: 'always' }
+      // less-equal so the back face of the sphere fails the depth test and
+      // we only see the prediction on the visible hemisphere. Drawn after
+      // mars-base at the same sphere depth, so it wins the equality tie.
+      parameters: { depthCompare: 'less-equal' }
     }),
   ];
   if (showLandmarks) {
@@ -424,7 +427,7 @@ function buildLayers() {
       getLineWidth: 1,
       stroked: true,
       pickable: false,
-      parameters: { depthCompare: 'always' }
+      parameters: { depthCompare: 'less-equal' }
     }));
     layers.push(new TextLayer({
       id: 'landmark-text',
@@ -442,7 +445,7 @@ function buildLayers() {
       outlineWidth: 2,
       fontSettings: { sdf: true, fontSize: 32 },
       pickable: false,
-      parameters: { depthCompare: 'always' }
+      parameters: { depthCompare: 'less-equal' }
     }));
   }
   return layers;

@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mars Subsurface Ice — v1</title>
+<script src="https://unpkg.com/deck.gl@9.1.12/dist.min.js"></script>
+<style>
+  :root {
+    --fg: #f3eee7;
+    --bg: #0a0a0e;
+    --panel: rgba(20, 20, 28, 0.92);
+    --accent: #c97e54;
+  }
+  html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--fg); font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; overflow: hidden; }
+  /* starfield — many small dots via layered radial gradients on a single ::before pseudo */
+  #stars {
+    position: absolute; inset: 0; pointer-events: none; z-index: 0;
+    background-color: var(--bg);
+    background-image:
+      radial-gradient(1px 1px at 20% 30%, rgba(255,255,255,0.85), transparent 60%),
+      radial-gradient(1px 1px at 75% 80%, rgba(255,255,255,0.75), transparent 60%),
+      radial-gradient(1px 1px at 12% 70%, rgba(255,255,255,0.85), transparent 60%),
+      radial-gradient(1.2px 1.2px at 88% 18%, rgba(255,255,255,0.95), transparent 60%),
+      radial-gradient(1px 1px at 62% 47%, rgba(255,255,255,0.55), transparent 60%),
+      radial-gradient(1px 1px at 33% 90%, rgba(255,255,255,0.7), transparent 60%),
+      radial-gradient(1px 1px at 50% 12%, rgba(255,255,255,0.65), transparent 60%),
+      radial-gradient(1px 1px at 5% 50%, rgba(255,255,255,0.5), transparent 60%),
+      radial-gradient(1.5px 1.5px at 95% 60%, rgba(255,230,210,0.95), transparent 60%),
+      radial-gradient(1px 1px at 25% 5%, rgba(255,255,255,0.6), transparent 60%),
+      radial-gradient(1px 1px at 70% 95%, rgba(255,255,255,0.7), transparent 60%),
+      radial-gradient(1px 1px at 40% 60%, rgba(255,255,255,0.45), transparent 60%),
+      radial-gradient(1px 1px at 82% 40%, rgba(220,230,255,0.85), transparent 60%),
+      radial-gradient(1px 1px at 15% 22%, rgba(255,255,255,0.55), transparent 60%),
+      radial-gradient(1.3px 1.3px at 55% 75%, rgba(255,255,255,0.85), transparent 60%);
+    background-size: 600px 600px, 800px 800px, 700px 700px, 900px 900px, 750px 750px,
+                     650px 650px, 850px 850px, 720px 720px, 950px 950px, 680px 680px,
+                     820px 820px, 780px 780px, 870px 870px, 730px 730px, 660px 660px;
+    animation: drift 240s linear infinite;
+  }
+  @keyframes drift {
+    from { background-position: 0 0, 0 0, 0 0, 0 0, 0 0, 0 0, 0 0, 0 0, 0 0, 0 0, 0 0, 0 0, 0 0, 0 0, 0 0; }
+    to   { background-position: -1200px 600px, -1600px -800px, 1400px -700px, -1800px 900px, 1500px 750px,
+                                 1300px -650px, -1700px -850px, 1440px 720px, -1900px -950px, 1360px 680px,
+                                 -1640px 820px, 1560px -780px, -1740px 870px, 1460px -730px, -1320px 660px; }
+  }
+  /* atmospheric rim glow behind the planet — soft radial halo */
+  #halo {
+    position: absolute; inset: 0; pointer-events: none; z-index: 1;
+    background: radial-gradient(circle at 50% 50%,
+      rgba(255, 145, 95, 0.10) 0%,
+      rgba(255, 120, 80, 0.06) 18%,
+      rgba(255, 100, 70, 0.03) 30%,
+      transparent 45%);
+  }
+  #map { position: absolute; inset: 0; z-index: 2; }
+  .panel { z-index: 5; }
+  .panel {
+    position: absolute; padding: 14px 16px; border-radius: 8px;
+    background: var(--panel); backdrop-filter: blur(8px);
+    box-shadow: 0 4px 18px rgba(0, 0, 0, 0.5);
+    font-size: 13px; line-height: 1.5;
+  }
+  #title { top: 16px; left: 16px; max-width: 380px; }
+  #title h1 { margin: 0 0 6px; font-size: 16px; font-weight: 600; }
+  #title .sub { color: #b8b0a4; font-size: 12px; }
+  #controls { top: 16px; right: 16px; min-width: 220px; }
+  #controls label { display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
+  #controls input[type=range] { flex: 1; accent-color: var(--accent); }
+  #controls .row { margin: 8px 0; display: flex; align-items: center; gap: 8px; }
+  #legend { bottom: 16px; left: 16px; }
+  #legend .gradient { width: 240px; height: 12px; border-radius: 3px; margin: 4px 0; }
+  #legend .ticks { display: flex; justify-content: space-between; font-size: 11px; color: #b8b0a4; }
+  #footer { bottom: 16px; right: 16px; font-size: 11px; color: #b8b0a4; max-width: 360px; }
+  #footer code { color: #c97e54; }
+  .gradient.ice { background: linear-gradient(to right,
+    rgba(0,0,0,0), rgba(180,210,240,0.4), rgba(220,235,250,0.7), rgba(245,250,255,0.95), #ffffff); }
+  .gradient.haze { background: linear-gradient(to right,
+    rgba(0,0,0,0), rgba(80,30,90,0.4), rgba(180,60,90,0.7), rgba(245,170,80,0.95), #fff0c4); }
+  button {
+    background: rgba(201, 126, 84, 0.2); color: var(--fg); border: 1px solid var(--accent);
+    border-radius: 4px; padding: 4px 10px; cursor: pointer; font: inherit;
+  }
+  button.active { background: var(--accent); color: var(--bg); }
+  button:hover:not(.active) { background: rgba(201, 126, 84, 0.4); }
+</style>
+</head>
+<body>
+  <div id="stars"></div>
+  <div id="halo"></div>
+  <div id="map"></div>
+
+  <div class="panel" id="title">
+    <h1>Where might there be ice under Mars's surface?</h1>
+    <div class="sub">
+      Bright = the model predicts ice in the top 5&thinsp;m. Plain Mars = no ice predicted.
+      Use the slider to hide regions where the model isn't confident — that's how you tell what's
+      grounded inference from what's extrapolation. Anchor points like Phoenix (which physically
+      verified ice at +68°N) and Curiosity (dry equator) let you check predictions against the
+      few places we've actually been.
+    </div>
+  </div>
+
+  <div class="panel" id="controls">
+    <div class="row" style="font-size:12px; color:#b8b0a4; margin-bottom:2px;">
+      Hide uncertain predictions
+    </div>
+    <div class="row" style="margin-top:0;">
+      <input type="range" id="confidence" min="0" max="1" step="0.01" value="0.5" style="flex:1; accent-color: var(--accent);" />
+    </div>
+    <div class="row" style="font-size:11px; color:#9c958a; justify-content:space-between; margin-top:-4px;">
+      <span>show all guesses</span>
+      <span>only confident</span>
+    </div>
+    <div class="row">
+      <label>Depth
+        <input type="range" id="depth" min="0" max="2" step="1" value="0" disabled />
+      </label>
+    </div>
+    <div class="row">
+      <label style="font-size:12px;">
+        <input type="checkbox" id="show-landmarks" checked />
+        Landmarks
+      </label>
+    </div>
+    <div class="row" style="font-size:11px; color:#b8b0a4;">
+      Depth slider is stubbed; v1 only models the 0–5&thinsp;m shallow layer. Deeper layers arrive
+      once SHARAD reflector catalogs are aggregated.
+    </div>
+  </div>
+
+  <div class="panel" id="legend">
+    <div>
+      Ice prediction
+      <div class="gradient ice"></div>
+      <div class="ticks"><span>none / unsure</span><span>likely</span><span>confident</span></div>
+    </div>
+  </div>
+
+  <div class="panel" id="footer">
+    LightGBM ensemble (5 seeds) trained on <b>~225,000</b> SWIM ice-consistency
+    cells as soft labels, predicting from MOLA topography + areoid and Odyssey
+    Neutron Spectrometer (epi/thermal/fast). Validation:
+    spatially-held-out SWIM blocks <b>AUC 0.87</b>; against the 177 hand-curated
+    + Dundas hard labels <b>AUC 0.85, Brier 0.20</b>.
+    Uncertainty = ensemble disagreement only — no proximity-to-label term, so
+    "uncertain" means the model itself is unsure, not just that no rover went there.
+    <br /><code>v2 shallow</code> · 0–5&thinsp;m only · SHARAD reflectors deferred to deep model.
+  </div>
+
+<script>
+const {Deck, _GlobeView: GlobeView, BitmapLayer, ScatterplotLayer, TextLayer, COORDINATE_SYSTEM} = deck;
+
+const LANDMARKS = [
+  {name: 'Phoenix landing (ice found at 5 cm)', lon: -125.75, lat: 68.22, kind: 'lander'},
+  {name: 'Viking 1 (no ice in trench)', lon: -47.95, lat: 22.27, kind: 'lander'},
+  {name: 'Curiosity / Gale (dry equator)', lon: 137.44, lat: -4.59, kind: 'lander'},
+  {name: 'Perseverance / Jezero', lon: 77.45, lat: 18.44, kind: 'lander'},
+  {name: 'Olympus Mons', lon: -133.8, lat: 18.65, kind: 'feature'},
+  {name: 'Valles Marineris', lon: -59.2, lat: -13.9, kind: 'feature'},
+  {name: 'Hellas Basin', lon: 70.5, lat: -42.4, kind: 'feature'},
+  {name: 'Korolev (ice-filled crater)', lon: 195.0 - 360, lat: 73.0, kind: 'feature'},
+];
+
+const MARS_BOUNDS = [-180, -90, 180, 90];
+
+fetch('./manifest.json').then(r => r.json()).then(m => {
+  console.log('manifest', m);
+});
+
+// confidence-threshold filter: 0 = show every prediction regardless of unc;
+// 1 = strict, only fully-confident predictions show. Mapped into the alpha
+// formula `alpha = (prob × max(0, 1 - k×unc))^1.15` where k = 2 × slider.
+let confidenceFilter = 0.5;
+let showLandmarks = true;
+let probImgRef = null, uncImgRef = null;
+
+// magma palette, no green — used for uncertainty haze
+const MAGMA_STOPS = [
+  [0.0,   0,   0,   4],
+  [0.15, 28,  16,  68],
+  [0.30, 79,  18, 123],
+  [0.45,128,  31, 113],
+  [0.60,181,  54,  94],
+  [0.75,229, 100,  72],
+  [0.90,251, 169,  84],
+  [1.0, 252, 253, 191],
+];
+function magma(v) {
+  for (let i = 1; i < MAGMA_STOPS.length; i++) {
+    const [t1, r1, g1, b1] = MAGMA_STOPS[i];
+    if (v <= t1) {
+      const [t0, r0, g0, b0] = MAGMA_STOPS[i-1];
+      const f = (v - t0) / (t1 - t0);
+      return [r0 + (r1-r0)*f, g0 + (g1-g0)*f, b0 + (b1-b0)*f];
+    }
+  }
+  return [252, 253, 191];
+}
+
+function loadImage(url) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = url;
+  });
+}
+
+function imageToData(img) {
+  const c = document.createElement('canvas');
+  c.width = img.width; c.height = img.height;
+  const ctx = c.getContext('2d');
+  ctx.drawImage(img, 0, 0);
+  return ctx.getImageData(0, 0, img.width, img.height);
+}
+
+// Cache the raw prob+unc pixel data once (decoded at load); we rebuild the
+// prediction canvas in-place as the confidence filter changes.
+let probData = null, uncData = null, predCanvas = null, predCtx = null, predImageData = null;
+let uncCDF = null;  // uncCDF[i] = fraction of pixels with unc <= i (i in 0..255)
+
+function initPrediction(probImg, uncImg) {
+  const W = probImg.width;
+  const H = probImg.height;
+  probData = imageToData(probImg).data;
+  uncData = imageToData(uncImg).data;
+  // Build uncertainty CDF so the slider acts on percentiles, not raw values
+  const hist = new Uint32Array(256);
+  for (let i = 0; i < uncData.length; i += 4) hist[uncData[i]]++;
+  const total = uncData.length / 4;
+  uncCDF = new Float32Array(256);
+  let cum = 0;
+  for (let i = 0; i < 256; i++) {
+    cum += hist[i];
+    uncCDF[i] = cum / total;
+  }
+  predCanvas = document.createElement('canvas');
+  predCanvas.width = W; predCanvas.height = H;
+  predCtx = predCanvas.getContext('2d');
+  predImageData = predCtx.createImageData(W, H);
+  rebuildPrediction();
+}
+
+// Inverse CDF: smallest u in [0,1] such that fraction(u' <= u) >= q
+function uncQuantile(q) {
+  for (let i = 0; i < 256; i++) {
+    if (uncCDF[i] >= q) return i / 255;
+  }
+  return 1.0;
+}
+
+// Binary threshold on uncertainty. A region is either kept (its full prob-graded
+// ice shows) or removed (bare Mars). A 3% softness band on the boundary avoids
+// hard pixel edges. Probability still smoothly drives alpha within kept regions.
+function rebuildPrediction() {
+  if (!probData) return;
+  // Slider position → fraction of pixels kept (most-confident first):
+  //   slider=0 → keep 100% (show all guesses)
+  //   slider=0.5 → keep 50% (the more confident half)
+  //   slider=1 → keep top 5% most confident
+  // Threshold pulled from the uncertainty CDF so each slider step removes an
+  // equal fraction of the map regardless of how unc values are distributed.
+  const keepFraction = 1.0 - 0.95 * confidenceFilter;
+  const threshold = uncQuantile(keepFraction);
+  const lo = threshold - 0.03;
+  const hi = threshold + 0.03;
+  const d = predImageData.data;
+  for (let i = 0; i < d.length; i += 4) {
+    const p = probData[i] / 255;
+    const u = uncData[i] / 255;
+    // smoothstep: 1 when u <= lo, 0 when u >= hi, smooth between
+    let visible;
+    if (u <= lo)      visible = 1;
+    else if (u >= hi) visible = 0;
+    else {
+      const t = (u - lo) / (hi - lo);
+      visible = 1 - t * t * (3 - 2 * t);
+    }
+    const sig = Math.pow(p, 1.15) * visible;
+    d[i]   = 220;
+    d[i+1] = 240;
+    d[i+2] = 255;
+    d[i+3] = Math.round(sig * 245);
+  }
+  predCtx.putImageData(predImageData, 0, 0);
+}
+
+const overlayCanvases = {};
+let currentViewState = { longitude: 0, latitude: 0, zoom: 1.6 };
+let userInteracted = false;
+const ROTATION_DEG_PER_SEC = 4;
+
+const deckInstance = new Deck({
+  parent: document.getElementById('map'),
+  views: new GlobeView({id: 'globe'}),
+  viewState: currentViewState,
+  controller: true,
+  onViewStateChange: ({viewState, interactionState}) => {
+    currentViewState = viewState;
+    if (interactionState && (interactionState.isDragging || interactionState.isZooming || interactionState.isPanning)) {
+      userInteracted = true;
+    }
+    deckInstance.setProps({viewState: currentViewState});
+  },
+  layers: []
+});
+
+let lastTs = performance.now();
+function tick(ts) {
+  const dt = (ts - lastTs) / 1000;
+  lastTs = ts;
+  if (!userInteracted && overlayCanvases.mars) {
+    currentViewState = {
+      ...currentViewState,
+      longitude: ((currentViewState.longitude + ROTATION_DEG_PER_SEC * dt + 540) % 360) - 180
+    };
+    deckInstance.setProps({viewState: currentViewState});
+  }
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+
+(async () => {
+  const [marsImg, probImg, uncImg] = await Promise.all([
+    loadImage('./mars_8k.jpg'),
+    loadImage('./shallow_probability_8bit.png'),
+    loadImage('./shallow_uncertainty_8bit.png'),
+  ]);
+  overlayCanvases.mars = marsImg;
+  initPrediction(probImg, uncImg);
+  refresh();
+})();
+
+let predRevision = 0;
+function buildLayers() {
+  if (!overlayCanvases.mars || !predCanvas) return [];
+  const layers = [
+    new BitmapLayer({
+      id: 'mars-base',
+      bounds: MARS_BOUNDS,
+      image: overlayCanvases.mars,
+      opacity: 1,
+      _imageCoordinateSystem: COORDINATE_SYSTEM.LNGLAT,
+      parameters: { depthCompare: 'less-equal' }
+    }),
+    new BitmapLayer({
+      id: 'prediction-' + predRevision,
+      bounds: MARS_BOUNDS,
+      image: predCanvas,
+      opacity: 1,
+      _imageCoordinateSystem: COORDINATE_SYSTEM.LNGLAT,
+      parameters: { depthCompare: 'always' }
+    }),
+  ];
+  if (showLandmarks) {
+    layers.push(new ScatterplotLayer({
+      id: 'landmark-pins',
+      data: LANDMARKS,
+      getPosition: d => [d.lon, d.lat, 0],
+      getRadius: 8000,
+      radiusUnits: 'meters',
+      getFillColor: d => d.kind === 'lander' ? [255, 220, 130, 240] : [255, 180, 110, 200],
+      getLineColor: [30, 20, 12, 240],
+      lineWidthUnits: 'pixels',
+      getLineWidth: 1,
+      stroked: true,
+      pickable: false,
+      parameters: { depthCompare: 'always' }
+    }));
+    layers.push(new TextLayer({
+      id: 'landmark-text',
+      data: LANDMARKS,
+      getPosition: d => [d.lon, d.lat, 0],
+      getText: d => d.name,
+      getSize: 11,
+      getColor: [255, 232, 200, 230],
+      getTextAnchor: 'start',
+      getAlignmentBaseline: 'center',
+      getPixelOffset: [10, -2],
+      fontFamily: 'ui-sans-serif, system-ui, sans-serif',
+      fontWeight: 500,
+      outlineColor: [10, 10, 14, 255],
+      outlineWidth: 2,
+      fontSettings: { sdf: true, fontSize: 32 },
+      pickable: false,
+      parameters: { depthCompare: 'always' }
+    }));
+  }
+  return layers;
+}
+
+function refresh() { deckInstance.setProps({layers: buildLayers()}); }
+
+// Confidence slider: rebuild prediction canvas + bump revision so deck.gl
+// re-uploads the texture (BitmapLayer otherwise caches by image ref).
+let pendingRebuild = false;
+function scheduleRebuild() {
+  if (pendingRebuild) return;
+  pendingRebuild = true;
+  requestAnimationFrame(() => {
+    pendingRebuild = false;
+    rebuildPrediction();
+    predRevision++;
+    refresh();
+  });
+}
+document.getElementById('confidence').addEventListener('input', e => {
+  confidenceFilter = parseFloat(e.target.value);
+  scheduleRebuild();
+});
+document.getElementById('show-landmarks').addEventListener('change', e => {
+  showLandmarks = e.target.checked;
+  refresh();
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,34 @@
+{
+  "version": "v1",
+  "depth_bin": {
+    "deep_5m_plus": {
+      "min_m": 5,
+      "max_m": 500
+    }
+  },
+  "crs": "IAU_2015:49900",
+  "shape": [
+    2160,
+    4320
+  ],
+  "bounds_lonlat": [
+    -180.0,
+    -90.0,
+    180.0,
+    90.0
+  ],
+  "files": {
+    "deep_probability_rgba.png": "deep_probability_rgba.png",
+    "deep_uncertainty_rgba.png": "deep_uncertainty_rgba.png",
+    "deep_probability_8bit.png": "deep_probability_8bit.png",
+    "deep_uncertainty_8bit.png": "deep_uncertainty_8bit.png"
+  },
+  "encoding": {
+    "rgba": "viridis (probability) / magma (uncertainty), alpha=0 means no data",
+    "8bit": "uint8 single channel, value = (probability or uncertainty) * 255, 0 if no data"
+  },
+  "model": {
+    "name": "mars-ice deep",
+    "source": "swim_deep"
+  }
+}

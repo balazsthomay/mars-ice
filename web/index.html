@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Mars Subsurface Ice — v1</title>
+<title>Mars Subsurface Ice</title>
 <script src="https://unpkg.com/deck.gl@9.1.12/dist.min.js"></script>
 <style>
   :root {
@@ -92,12 +92,11 @@
 
   <div class="panel" id="title">
     <h1>Where might there be ice under Mars's surface?</h1>
-    <div class="sub">
+    <div class="sub" id="title-sub">
       Bright = the model predicts ice in the top 5&thinsp;m. Plain Mars = no ice predicted.
       Use the slider to hide regions where the model isn't confident — that's how you tell what's
-      grounded inference from what's extrapolation. Anchor points like Phoenix (which physically
-      verified ice at +68°N) and Curiosity (dry equator) let you check predictions against the
-      few places we've actually been.
+      grounded inference from what's extrapolation. Switch to the deep band to see ice predicted
+      below 5 m, where the polar caps and lobate-debris aprons dominate.
     </div>
   </div>
 
@@ -112,20 +111,21 @@
       <span>show all guesses</span>
       <span>only confident</span>
     </div>
-    <div class="row">
-      <label>Depth
-        <input type="range" id="depth" min="0" max="2" step="1" value="0" disabled />
-      </label>
+    <div class="row" style="font-size:12px; color:#b8b0a4; margin-bottom:2px; margin-top:10px;">
+      Depth band
     </div>
-    <div class="row">
+    <div class="row" style="margin-top:0;">
+      <input type="range" id="depth" min="0" max="1" step="1" value="0" style="flex:1; accent-color: var(--accent);" />
+    </div>
+    <div class="row" style="font-size:11px; color:#9c958a; justify-content:space-between; margin-top:-4px;">
+      <span>0–5&thinsp;m (shallow)</span>
+      <span>5&thinsp;m+ (deep)</span>
+    </div>
+    <div class="row" style="margin-top:10px;">
       <label style="font-size:12px;">
         <input type="checkbox" id="show-landmarks" checked />
         Landmarks
       </label>
-    </div>
-    <div class="row" style="font-size:11px; color:#b8b0a4;">
-      Depth slider is stubbed; v1 only models the 0–5&thinsp;m shallow layer. Deeper layers arrive
-      once SHARAD reflector catalogs are aggregated.
     </div>
   </div>
 
@@ -138,17 +138,16 @@
   </div>
 
   <div class="panel" id="footer">
-    LightGBM ensemble (5 seeds) trained on <b>~225,000</b> SWIM ice-consistency
-    cells as soft labels, predicting from MOLA topography and Odyssey Neutron
-    Spectrometer (epi/thermal/fast). Mars areoid dropped after a sanity check
-    showed it carried partial latitude correlation. Validation against
-    <b>1,356 globally distributed hard labels</b> (Dundas crater scarps + Daubar
-    new impacts + 7 in-situ landers) gives <b>AUC 0.93, Brier 0.08</b>; on the 996
-    tropical sites Daubar found dry, <b>Brier 0.04</b> — the model correctly
-    predicts low ice probability there even though those craters are not in training.
-    Uncertainty = ensemble disagreement only — no proximity-to-label term, so
-    "uncertain" means the model itself is unsure, not just that no rover went there.
-    <br /><code>v2.1 shallow</code> · 0–5&thinsp;m only · SHARAD reflectors deferred to deep model.
+    Two parallel LightGBM ensembles (5 seeds each) trained on SWIM ice-consistency
+    as soft labels, predicting from MOLA topography + Odyssey Neutron Spectrometer.
+    <b>Shallow (0–5&thinsp;m):</b> validates against 1,356 globally distributed hard
+    labels at <b>AUC 0.93, Brier 0.08</b> (tropical Brier 0.04). <b>Deep (5&thinsp;m+):</b>
+    held-out SWIM-block AUC <b>0.83</b>, Brier 0.03. Topography dominates feature
+    importance for the deep band — neutron flux only sees the top meter, so deep
+    predictions ride on terrain morphology (LDAs, polar caps, scarps).
+    Uncertainty = ensemble disagreement only — "uncertain" means the model is unsure,
+    not that no rover went there.
+    <br /><code>v3 dual-depth</code> · SHARAD hard labels at depth still deferred.
   </div>
 
 <script>
@@ -218,26 +217,35 @@ function imageToData(img) {
   return ctx.getImageData(0, 0, img.width, img.height);
 }
 
-// Cache the raw prob+unc pixel data once (decoded at load); we rebuild the
-// prediction canvas in-place as the confidence filter changes.
-let probData = null, uncData = null, predCanvas = null, predCtx = null, predImageData = null;
-let uncCDF = null;  // uncCDF[i] = fraction of pixels with unc <= i (i in 0..255)
+// Cache the raw prob+unc pixel data once per depth band (decoded at load); we
+// rebuild the prediction canvas in-place as the confidence filter or depth changes.
+const bands = {
+  shallow: { probData: null, uncData: null, uncCDF: null },
+  deep:    { probData: null, uncData: null, uncCDF: null },
+};
+let currentBand = 'shallow';
+let predCanvas = null, predCtx = null, predImageData = null;
 
-function initPrediction(probImg, uncImg) {
-  const W = probImg.width;
-  const H = probImg.height;
-  probData = imageToData(probImg).data;
-  uncData = imageToData(uncImg).data;
-  // Build uncertainty CDF so the slider acts on percentiles, not raw values
+function _buildCDF(uncData) {
   const hist = new Uint32Array(256);
   for (let i = 0; i < uncData.length; i += 4) hist[uncData[i]]++;
   const total = uncData.length / 4;
-  uncCDF = new Float32Array(256);
+  const cdf = new Float32Array(256);
   let cum = 0;
   for (let i = 0; i < 256; i++) {
     cum += hist[i];
-    uncCDF[i] = cum / total;
+    cdf[i] = cum / total;
   }
+  return cdf;
+}
+
+function ingestBand(name, probImg, uncImg) {
+  bands[name].probData = imageToData(probImg).data;
+  bands[name].uncData = imageToData(uncImg).data;
+  bands[name].uncCDF = _buildCDF(bands[name].uncData);
+}
+
+function initPredictionCanvas(W, H) {
   predCanvas = document.createElement('canvas');
   predCanvas.width = W; predCanvas.height = H;
   predCtx = predCanvas.getContext('2d');
@@ -245,10 +253,12 @@ function initPrediction(probImg, uncImg) {
   rebuildPrediction();
 }
 
-// Inverse CDF: smallest u in [0,1] such that fraction(u' <= u) >= q
+// Inverse CDF for the active band: smallest u such that fraction(u' <= u) >= q
 function uncQuantile(q) {
+  const cdf = bands[currentBand].uncCDF;
+  if (!cdf) return 1.0;
   for (let i = 0; i < 256; i++) {
-    if (uncCDF[i] >= q) return i / 255;
+    if (cdf[i] >= q) return i / 255;
   }
   return 1.0;
 }
@@ -257,7 +267,8 @@ function uncQuantile(q) {
 // ice shows) or removed (bare Mars). A 3% softness band on the boundary avoids
 // hard pixel edges. Probability still smoothly drives alpha within kept regions.
 function rebuildPrediction() {
-  if (!probData) return;
+  const band = bands[currentBand];
+  if (!band.probData || !predImageData) return;
   // Slider position → fraction of pixels kept (most-confident first):
   //   slider=0 → keep 100% (show all guesses)
   //   slider=0.5 → keep 50% (the more confident half)
@@ -269,6 +280,8 @@ function rebuildPrediction() {
   const lo = threshold - 0.03;
   const hi = threshold + 0.03;
   const d = predImageData.data;
+  const probData = band.probData;
+  const uncData = band.uncData;
   for (let i = 0; i < d.length; i += 4) {
     const p = probData[i] / 255;
     const u = uncData[i] / 255;
@@ -325,13 +338,17 @@ function tick(ts) {
 requestAnimationFrame(tick);
 
 (async () => {
-  const [marsImg, probImg, uncImg] = await Promise.all([
+  const [marsImg, probShallow, uncShallow, probDeep, uncDeep] = await Promise.all([
     loadImage('./mars_8k.jpg'),
     loadImage('./shallow_probability_8bit.png'),
     loadImage('./shallow_uncertainty_8bit.png'),
+    loadImage('./deep_probability_8bit.png'),
+    loadImage('./deep_uncertainty_8bit.png'),
   ]);
   overlayCanvases.mars = marsImg;
-  initPrediction(probImg, uncImg);
+  ingestBand('shallow', probShallow, uncShallow);
+  ingestBand('deep', probDeep, uncDeep);
+  initPredictionCanvas(probShallow.width, probShallow.height);
   refresh();
 })();
 
@@ -410,6 +427,10 @@ function scheduleRebuild() {
 }
 document.getElementById('confidence').addEventListener('input', e => {
   confidenceFilter = parseFloat(e.target.value);
+  scheduleRebuild();
+});
+document.getElementById('depth').addEventListener('input', e => {
+  currentBand = parseInt(e.target.value, 10) === 1 ? 'deep' : 'shallow';
   scheduleRebuild();
 });
 document.getElementById('show-landmarks').addEventListener('change', e => {

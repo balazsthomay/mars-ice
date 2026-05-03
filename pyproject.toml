@@ -1,0 +1,25 @@
+[project]
+name = "mars-ice"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28.1",
+    "lightgbm>=4.6.0",
+    "modal>=1.4.2",
+    "numpy>=2.4.4",
+    "pdr>=1.4.3",
+    "pillow>=12.2.0",
+    "polars>=1.40.1",
+    "pyproj>=3.7.2",
+    "rasterio>=1.5.0",
+    "scikit-learn>=1.8.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.15.12",
+]

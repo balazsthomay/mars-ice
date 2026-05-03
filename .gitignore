@@ -1,0 +1,38 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+SPEC.md
+CLAUDE.md
+.claude/
+.env
+.coverage
+.superset
+.DS_Store
+
+# Data, models, tiles — anything large or derived
+data/
+models/
+tiles/
+tiles_local/
+*.tif
+*.tiff
+*.img
+*.lbl
+*.LBL
+*.IMG
+*.h5
+*.parquet
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/

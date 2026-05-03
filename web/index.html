@@ -108,10 +108,8 @@
   <div class="panel" id="title">
     <h1>Where might there be ice under Mars's surface?</h1>
     <div class="sub" id="title-sub">
-      Bright = the model predicts ice in the top 5&thinsp;m. Plain Mars = no ice predicted.
-      Use the slider to hide regions where the model isn't confident — that's how you tell what's
-      grounded inference from what's extrapolation. Switch to the deep band to see ice predicted
-      below 5 m, where the polar caps and lobate-debris aprons dominate.
+      Bright = ice predicted. Pull the slider to hide low-confidence guesses;
+      switch bands to look deeper than 5&thinsp;m.
     </div>
   </div>
 
@@ -153,16 +151,10 @@
   </div>
 
   <div class="panel" id="footer">
-    Two parallel LightGBM ensembles (5 seeds each) trained on SWIM ice-consistency
-    as soft labels, predicting from MOLA topography + Odyssey Neutron Spectrometer.
-    <b>Shallow (0–5&thinsp;m):</b> validates against 1,356 globally distributed hard
-    labels at <b>AUC 0.93, Brier 0.08</b> (tropical Brier 0.04). <b>Deep (5&thinsp;m+):</b>
-    held-out SWIM-block AUC <b>0.83</b>, Brier 0.03. Topography dominates feature
-    importance for the deep band — neutron flux only sees the top meter, so deep
-    predictions ride on terrain morphology (LDAs, polar caps, scarps).
-    Uncertainty = ensemble disagreement only — "uncertain" means the model is unsure,
-    not that no rover went there.
-    <br /><code>v3 dual-depth</code> · SHARAD hard labels at depth still deferred.
+    LightGBM on SWIM ice-consistency, from MOLA topography + neutron flux.
+    <b>Shallow:</b> AUC 0.93 / Brier 0.08 vs 1,356 hard labels.
+    <b>Deep:</b> AUC 0.83 / Brier 0.03, SWIM-block holdout.
+    Uncertainty = ensemble disagreement.
   </div>
 
 <script>

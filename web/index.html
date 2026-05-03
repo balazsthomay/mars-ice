@@ -60,6 +60,21 @@
     background: var(--panel); backdrop-filter: blur(8px);
     box-shadow: 0 4px 18px rgba(0, 0, 0, 0.5);
     font-size: 13px; line-height: 1.5;
+    /* Let pointer events pass through panel chrome so dragging the globe
+       across a panel keeps the drag intact. Re-enable pointer events on
+       interactive elements only. */
+    pointer-events: none;
+  }
+  .panel input, .panel button, .panel label, .panel select, .panel textarea {
+    pointer-events: auto;
+  }
+  /* During an active drag started on the globe, freeze panel interactivity so
+     the cursor crossing a button or slider doesn't steal pointermove events
+     from deck.gl's drag handler. Re-enables on pointerup. */
+  body.dragging .panel input,
+  body.dragging .panel button,
+  body.dragging .panel label {
+    pointer-events: none;
   }
   #title { top: 16px; left: 16px; max-width: 380px; }
   #title h1 { margin: 0 0 6px; font-size: 16px; font-weight: 600; }
@@ -111,21 +126,21 @@
       <span>show all guesses</span>
       <span>only confident</span>
     </div>
-    <div class="row" style="font-size:12px; color:#b8b0a4; margin-bottom:2px; margin-top:10px;">
+    <div class="row" style="font-size:12px; color:#b8b0a4; margin-bottom:4px; margin-top:10px;">
       Depth band
     </div>
-    <div class="row" style="margin-top:0;">
-      <input type="range" id="depth" min="0" max="1" step="1" value="0" style="flex:1; accent-color: var(--accent);" />
+    <div class="row" style="margin-top:0; gap:6px;">
+      <button id="band-shallow" type="button" class="band-btn active" data-band="shallow" style="flex:1;">0–5&thinsp;m</button>
+      <button id="band-deep" type="button" class="band-btn" data-band="deep" style="flex:1;">5&thinsp;m+</button>
     </div>
-    <div class="row" style="font-size:11px; color:#9c958a; justify-content:space-between; margin-top:-4px;">
-      <span>0–5&thinsp;m (shallow)</span>
-      <span>5&thinsp;m+ (deep)</span>
-    </div>
-    <div class="row" style="margin-top:10px;">
+    <div class="row" style="margin-top:10px; justify-content: space-between; gap:6px;">
       <label style="font-size:12px;">
         <input type="checkbox" id="show-landmarks" checked />
         Landmarks
       </label>
+      <button id="zoom-out" type="button" title="Zoom out" style="padding:4px 10px;">−</button>
+      <button id="zoom-in"  type="button" title="Zoom in"  style="padding:4px 10px;">+</button>
+      <button id="reset-rotation" type="button" title="Resume auto-rotation from the front">Reset</button>
     </div>
   </div>
 
@@ -282,8 +297,19 @@ function rebuildPrediction() {
   const d = predImageData.data;
   const probData = band.probData;
   const uncData = band.uncData;
+  // Probability threshold: pixels below this are fully transparent so Mars shows
+  // through. Without it, the soft prob^k curve smears low-probability cyan over
+  // the whole globe and reads as "the planet is hazy" instead of "ice is here".
+  // 0.15 is below SWIM's "low" confidence floor so we don't kill any pixel that
+  // the model actually predicts as ice.
+  const P_FLOOR = 0.15;
+  const P_FLOOR_8 = Math.round(P_FLOOR * 255);
   for (let i = 0; i < d.length; i += 4) {
-    const p = probData[i] / 255;
+    const p8 = probData[i];
+    if (p8 < P_FLOOR_8) {
+      d[i+3] = 0;
+      continue;
+    }
     const u = uncData[i] / 255;
     // smoothstep: 1 when u <= lo, 0 when u >= hi, smooth between
     let visible;
@@ -293,6 +319,13 @@ function rebuildPrediction() {
       const t = (u - lo) / (hi - lo);
       visible = 1 - t * t * (3 - 2 * t);
     }
+    if (visible === 0) {
+      d[i+3] = 0;
+      continue;
+    }
+    // Remap p in [P_FLOOR, 1] to [0, 1] before the gamma so the visible range
+    // covers full alpha smoothly instead of starting at the threshold value.
+    const p = (p8 / 255 - P_FLOOR) / (1 - P_FLOOR);
     const sig = Math.pow(p, 1.15) * visible;
     d[i]   = 220;
     d[i+1] = 240;
@@ -303,7 +336,8 @@ function rebuildPrediction() {
 }
 
 const overlayCanvases = {};
-let currentViewState = { longitude: 0, latitude: 0, zoom: 1.6 };
+const INITIAL_VIEW_STATE = { longitude: 0, latitude: 0, zoom: 1.6, minZoom: 0.5, maxZoom: 3.0 };
+let currentViewState = { ...INITIAL_VIEW_STATE };
 let userInteracted = false;
 const ROTATION_DEG_PER_SEC = 4;
 
@@ -311,26 +345,27 @@ const deckInstance = new Deck({
   parent: document.getElementById('map'),
   views: new GlobeView({id: 'globe'}),
   viewState: currentViewState,
-  controller: true,
-  onViewStateChange: ({viewState, interactionState}) => {
-    currentViewState = viewState;
-    if (interactionState && (interactionState.isDragging || interactionState.isZooming || interactionState.isPanning)) {
-      userInteracted = true;
-    }
-    deckInstance.setProps({viewState: currentViewState});
-  },
+  // We disable EVERY interaction in deck.gl's controller and run our own
+  // pointer handling below. Reason: deck.gl 9's GlobeView controller has a
+  // hard-coded latitude clamp at 85.05° (the Mercator clip lat) and pushing
+  // the drag past it triggers an oscillation in its pan math — the camera
+  // alternates between lat=85 and intermediate values at 60Hz, which the user
+  // sees as a flicker. We avoid the boundary entirely by clamping in our own
+  // handler at ±75°, well clear of the native limit.
+  controller: false,
   layers: []
 });
 
+// Auto-rotation: spin the globe slowly until the user interacts. Once dragStart
+// is captured (in the pointer handler below) or any zoom/reset button is used,
+// userInteracted flips true and the tick stops touching viewState.
 let lastTs = performance.now();
 function tick(ts) {
   const dt = (ts - lastTs) / 1000;
   lastTs = ts;
-  if (!userInteracted && overlayCanvases.mars) {
-    currentViewState = {
-      ...currentViewState,
-      longitude: ((currentViewState.longitude + ROTATION_DEG_PER_SEC * dt + 540) % 360) - 180
-    };
+  if (!userInteracted && !dragStart) {
+    const lon = currentViewState.longitude - ROTATION_DEG_PER_SEC * dt;
+    currentViewState = { ...currentViewState, longitude: ((lon + 540) % 360) - 180 };
     deckInstance.setProps({viewState: currentViewState});
   }
   requestAnimationFrame(tick);
@@ -339,7 +374,7 @@ requestAnimationFrame(tick);
 
 (async () => {
   const [marsImg, probShallow, uncShallow, probDeep, uncDeep] = await Promise.all([
-    loadImage('./mars_8k.jpg'),
+    loadImage('./mars_4k.jpg'),
     loadImage('./shallow_probability_8bit.png'),
     loadImage('./shallow_uncertainty_8bit.png'),
     loadImage('./deep_probability_8bit.png'),
@@ -365,6 +400,9 @@ function buildLayers() {
       parameters: { depthCompare: 'less-equal' }
     }),
     new BitmapLayer({
+      // BitmapLayer's `image` prop only triggers a re-upload when its reference
+      // changes. Mutating predCanvas in place is invisible to deck.gl. Bumping
+      // the layer id forces a fresh layer that re-uploads the (mutated) canvas.
       id: 'prediction-' + predRevision,
       bounds: MARS_BOUNDS,
       image: predCanvas,
@@ -413,30 +451,109 @@ function buildLayers() {
 function refresh() { deckInstance.setProps({layers: buildLayers()}); }
 
 // Confidence slider: rebuild prediction canvas + bump revision so deck.gl
-// re-uploads the texture (BitmapLayer otherwise caches by image ref).
+// re-uploads the texture via updateTriggers (without recreating the layer).
+// The rebuild itself is the slow path (4320×2160 pixel loop + 37 MB GPU
+// upload), so we coalesce slider events: rAF debounce gives one rebuild per
+// frame at most, and a min interval guarantees the previous rebuild has had
+// time to finish before we kick off the next.
 let pendingRebuild = false;
+let lastRebuildAt = 0;
+const MIN_REBUILD_INTERVAL_MS = 50;
 function scheduleRebuild() {
   if (pendingRebuild) return;
   pendingRebuild = true;
-  requestAnimationFrame(() => {
+  const elapsed = performance.now() - lastRebuildAt;
+  const delay = Math.max(0, MIN_REBUILD_INTERVAL_MS - elapsed);
+  const fire = () => requestAnimationFrame(() => {
     pendingRebuild = false;
+    lastRebuildAt = performance.now();
     rebuildPrediction();
     predRevision++;
     refresh();
   });
+  if (delay > 0) setTimeout(fire, delay); else fire();
 }
 document.getElementById('confidence').addEventListener('input', e => {
   confidenceFilter = parseFloat(e.target.value);
   scheduleRebuild();
 });
-document.getElementById('depth').addEventListener('input', e => {
-  currentBand = parseInt(e.target.value, 10) === 1 ? 'deep' : 'shallow';
-  scheduleRebuild();
+document.querySelectorAll('.band-btn').forEach(btn => {
+  btn.addEventListener('click', e => {
+    const band = e.currentTarget.dataset.band;
+    if (band === currentBand) return;
+    currentBand = band;
+    document.querySelectorAll('.band-btn').forEach(b => b.classList.toggle('active', b.dataset.band === band));
+    scheduleRebuild();
+  });
 });
 document.getElementById('show-landmarks').addEventListener('change', e => {
   showLandmarks = e.target.checked;
   refresh();
 });
+document.getElementById('reset-rotation').addEventListener('click', () => {
+  currentViewState = { ...INITIAL_VIEW_STATE };
+  userInteracted = false;
+  deckInstance.setProps({ viewState: currentViewState });
+});
+const ZOOM_STEP = 0.4, ZOOM_MIN = 0.5, ZOOM_MAX = 3.0;
+function bumpZoom(delta) {
+  const z = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, currentViewState.zoom + delta));
+  if (z === currentViewState.zoom) return;
+  currentViewState = { ...currentViewState, zoom: z };
+  userInteracted = true;
+  deckInstance.setProps({ viewState: currentViewState });
+}
+document.getElementById('zoom-in').addEventListener('click', () => bumpZoom(+ZOOM_STEP));
+document.getElementById('zoom-out').addEventListener('click', () => bumpZoom(-ZOOM_STEP));
+
+// Custom drag handler. We own pointer events end-to-end so the camera never
+// approaches deck.gl's 85.05° native clamp at the Mercator clip latitude.
+// Pixel→degree mapping with a fixed gain of 180° per viewport — a full-viewport
+// drag rotates ~180°. Latitude clamped at ±75° to stay well below the native limit.
+const MAX_DRAG_LAT = 75;
+let dragStart = null;
+
+function setView(next) {
+  currentViewState = { ...currentViewState, ...next };
+  deckInstance.setProps({viewState: currentViewState});
+}
+
+const mapEl = document.getElementById('map');
+mapEl.addEventListener('pointerdown', e => {
+  if (e.button !== 0) return;
+  document.body.classList.add('dragging');
+  dragStart = {
+    x: e.clientX,
+    y: e.clientY,
+    lon: currentViewState.longitude,
+    lat: currentViewState.latitude,
+  };
+  mapEl.setPointerCapture?.(e.pointerId);
+  userInteracted = true;
+});
+mapEl.addEventListener('pointermove', e => {
+  if (!dragStart) return;
+  const w = mapEl.clientWidth, h = mapEl.clientHeight;
+  const gain = 180;
+  const dx = e.clientX - dragStart.x;
+  const dy = e.clientY - dragStart.y;
+  let lon = dragStart.lon - dx * gain / w;
+  let lat = dragStart.lat + dy * gain / h;
+  lon = ((lon + 540) % 360) - 180;
+  lat = Math.max(-MAX_DRAG_LAT, Math.min(MAX_DRAG_LAT, lat));
+  setView({ longitude: lon, latitude: lat });
+});
+function _endDrag(e) {
+  if (dragStart) {
+    if (e?.pointerId != null) mapEl.releasePointerCapture?.(e.pointerId);
+    dragStart = null;
+  }
+  document.body.classList.remove('dragging');
+}
+mapEl.addEventListener('pointerup', _endDrag);
+mapEl.addEventListener('pointercancel', _endDrag);
+document.addEventListener('pointerup', _endDrag);
+
 </script>
 </body>
 </html>

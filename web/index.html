@@ -79,7 +79,10 @@
   #title { top: 16px; left: 16px; max-width: 380px; }
   #title h1 { margin: 0 0 6px; font-size: 16px; font-weight: 600; }
   #title .sub { color: #b8b0a4; font-size: 12px; }
-  #controls { top: 16px; right: 16px; min-width: 220px; }
+  /* Fixed width + reserved readout height so the panel never resizes as the
+     climate text changes length. */
+  #controls { top: 16px; right: 16px; width: 300px; }
+  #climate-readout { min-height: 32px; }
   #controls label { display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
   #controls input[type=range] { flex: 1; accent-color: var(--accent); }
   #controls .row { margin: 8px 0; display: flex; align-items: center; gap: 8px; }
@@ -110,9 +113,8 @@
   <div class="panel" id="title">
     <h1>Where might there be ice under Mars's surface?</h1>
     <div class="sub" id="title-sub">
-      Bright = ice predicted. Pull the slider to hide low-confidence guesses;
-      switch bands to look deeper than 5&thinsp;m. Warm the planet to melt the
-      ice and flood the lowlands.
+      Bright = predicted ice. Slide to hide low-confidence guesses;
+      warm the planet to melt ice and flood the lowlands.
     </div>
   </div>
 
@@ -145,7 +147,7 @@
       <span>+80&thinsp;&deg;C global</span>
     </div>
     <div class="row" id="climate-readout" style="font-size:11px; color:#b8b0a4; line-height:1.45; margin-top:2px; display:block;">
-      &Delta;T +0&thinsp;&deg;C global &mdash; equator &minus;58&thinsp;&deg;C, poles &minus;113&thinsp;&deg;C; everything stays frozen.
+      &Delta;T +0&thinsp;&deg;C &mdash; equator &minus;58&thinsp;&deg;C, poles &minus;113&thinsp;&deg;C<br>everything stays frozen
     </div>
     <div class="row" style="margin-top:6px;">
       <label style="font-size:12px;" title="Adds the water Mars lost to space and crustal minerals since ~3.5 Ga — enough to refill the mapped ancient shoreline">
@@ -178,13 +180,10 @@
   </div>
 
   <div class="panel" id="footer">
-    LightGBM on SWIM ice-consistency, from MOLA topography + neutron flux.
-    <b>Shallow:</b> AUC 0.93 / Brier 0.08 vs 1,356 hard labels.
-    <b>Deep:</b> AUC 0.83 / Brier 0.03, SWIM-block holdout.
-    Uncertainty = ensemble disagreement.
-    Water sim: polar-amplified warming, melt onset at 252&thinsp;K annual mean,
-    flood fill of MOLA topography; polar reservoir &asymp;5&times;10&#8310;&thinsp;km&sup3;;
-    assumes a thick atmosphere.
+    LightGBM on SWIM ice-consistency from MOLA topography + neutron flux.
+    Shallow AUC 0.93, deep 0.83; uncertainty = ensemble disagreement.
+    Water: polar-amplified warming floods MOLA topography;
+    frozen-over seas shown pale.
   </div>
 
 <script>
@@ -291,6 +290,12 @@ const T_EQ_K = 215, T_DROP_K = 55;
 const AMP_EQ = 0.8, AMP_S2 = 0.6;
 const MELT_ONSET_K = 252;
 const MELT_SOFT_K = 5;       // smooth 0→1 melt over this band, no hard pixel rows
+// Standing water freezes over where the annual mean sits below ~271 K (salty
+// sea). Not a contradiction with the 252 K melt onset: ground ice ablates in
+// summer and the runoff pools downhill, but the sea SURFACE follows the annual
+// mean — glacier-fed frozen lakes. Frozen seas render pale instead of blue.
+const SEA_FREEZE_K = 271;
+const SEA_FREEZE_SOFT_K = 6;
 const DEEP_LAG_K = 15;
 // Polar reservoir: layered deposits + circumpolar ground ice, ~5×10⁶ km³
 // (≈33 m global-equivalent — the dominant inventory). Approximated as a flat
@@ -298,6 +303,12 @@ const DEEP_LAG_K = 15;
 // confidence slider does not apply to them.
 const CAP_LAT_DEG = 78;
 const CAP_THICKNESS_KM = 1.5;
+// A kilometres-thick ice sheet doesn't vanish the moment it crosses the melt
+// onset like metres of regolith ice: its melt-through scales with sustained
+// warmth above onset. Linear ramp over CAP_MELT_RANGE_K of excess temperature,
+// which spreads cap melt over the top ~15° of the slider instead of dumping
+// the whole reservoir in a 3-degree window.
+const CAP_MELT_RANGE_K = 15;
 const SHALLOW_THICKNESS_KM = 4 / 1000;  // assumed max ice column in 0–5 m band
 const DEEP_THICKNESS_KM = 20 / 1000;    // conservative column for the 5 m+ band
 // Ancient-inventory mode: early Mars had ~6× today's accessible water; it was
@@ -338,6 +349,11 @@ function meltFraction(latDeg, deltaTg, lagK) {
   if (t <= 0) return 0;
   if (t >= 1) return 1;
   return t * t * (3 - 2 * t);
+}
+// Melted fraction of the thick polar slab (see CAP_MELT_RANGE_K)
+function capMeltFraction(latDeg, deltaTg) {
+  const t = (warmedTempK(latDeg, deltaTg) - MELT_ONSET_K) / CAP_MELT_RANGE_K;
+  return t <= 0 ? 0 : t >= 1 ? 1 : t;
 }
 
 function _buildCDF(uncData) {
@@ -561,15 +577,23 @@ function computeMeltVolumeKm3() {
   const H = elevH;
   const uS = uncThresholdByte('shallow');
   const uD = uncThresholdByte('deep');
-  const capScale = ancientMode ? 1 + ancientExtraKm3 / totalCapKm3 : 1;
-  let v = 0;
+  let v = 0, vMax = 0;
   for (let r = 0; r < H; r++) {
     const lat = rowLatDeg(r, H);
+    const rowS = rowVolCumShallow[r * 256 + uS];
+    const rowD = rowVolCumDeep[r * 256 + uD];
+    vMax += rowS + rowD + rowVolCap[r];
     const mfS = meltFraction(lat, warmDeltaT, 0);
-    if (mfS > 0) v += (rowVolCumShallow[r * 256 + uS] + rowVolCap[r] * capScale) * mfS;
+    if (mfS > 0) v += rowS * mfS;
     const mfD = meltFraction(lat, warmDeltaT, DEEP_LAG_K);
-    if (mfD > 0) v += rowVolCumDeep[r * 256 + uD] * mfD;
+    if (mfD > 0) v += rowD * mfD;
+    if (rowVolCap[r] > 0) v += rowVolCap[r] * capMeltFraction(lat, warmDeltaT);
   }
+  // The ancient inventory is released in proportion to overall melt progress —
+  // it returns as precipitation everywhere, not as a polar slab — so it ramps
+  // in smoothly from the first melt instead of dumping when the caps cross
+  // the onset. Endpoint unchanged: full melt still reaches the paleo-shoreline.
+  if (ancientMode && vMax > 0) v += ancientExtraKm3 * (v / vMax);
   return v;
 }
 
@@ -591,14 +615,25 @@ function rebuildWater() {
   if (!isFinite(lvl)) {
     d.fill(0);
   } else {
+    // Per-row sea-surface state: 0 = open water, 1 = frozen over (pale)
+    const H = elevH, W = elevW;
+    const freezeRow = new Float32Array(H);
+    for (let r = 0; r < H; r++) {
+      const f = (SEA_FREEZE_K - warmedTempK(rowLatDeg(r, H), warmDeltaT)) / SEA_FREEZE_SOFT_K;
+      freezeRow[r] = f <= 0 ? 0 : f >= 1 ? 1 : f;
+    }
     for (let px = 0, i = 0; px < elevData.length; px++, i += 4) {
       const depth = lvl - elevData[px];
       if (depth <= 0) { d[i+3] = 0; continue; }
       const t = depth >= 1500 ? 1 : depth / 1500;
-      d[i]   = 125 + (8 - 125) * t;
-      d[i+1] = 190 + (34 - 190) * t;
-      d[i+2] = 225 + (80 - 225) * t;
-      d[i+3] = 165 + 90 * t;
+      const fz = freezeRow[(px / W) | 0];
+      const r0 = 125 + (8 - 125) * t;
+      const g0 = 190 + (34 - 190) * t;
+      const b0 = 225 + (80 - 225) * t;
+      d[i]   = r0 + (215 - r0) * fz;
+      d[i+1] = g0 + (228 - g0) * fz;
+      d[i+2] = b0 + (238 - b0) * fz;
+      d[i+3] = (165 + 90 * t) + (235 - (165 + 90 * t)) * fz;
     }
   }
   waterCtx.putImageData(waterImageData, 0, 0);
@@ -612,29 +647,22 @@ function formatVolume(volKm3) {
 
 function updateClimateReadout(meltVolKm3) {
   const el = document.getElementById('climate-readout');
+  const sign = v => (v >= 0 ? '+' : '−') + Math.abs(v);
   const eqC = Math.round(warmedTempK(0, warmDeltaT) - 273.15);
   const poleC = Math.round(warmedTempK(90, warmDeltaT) - 273.15);
-  const sign = v => (v >= 0 ? '+' : '−') + Math.abs(v);
   // Latitude where the amplified warming crosses the melt onset:
-  // sin²lat = (ONSET - T_EQ - AMP_EQ·ΔT) / (AMP_S2·ΔT - T_DROP).
-  // Within the slider range the denominator stays negative (temperature still
-  // falls poleward), so the melt zone is the equatorward band.
+  // sin²lat = (ONSET - T_EQ - AMP_EQ·ΔT) / (AMP_S2·ΔT - T_DROP); the denominator
+  // stays negative across the slider range, so the melt zone is equatorward.
   const x = (MELT_ONSET_K - T_EQ_K - AMP_EQ * warmDeltaT) / (AMP_S2 * warmDeltaT - T_DROP_K);
-  let meltLine;
-  if (x <= 0) meltLine = 'everything stays frozen';
-  else if (x >= 1) meltLine = 'melting at every latitude';
-  else meltLine = `summer melt reaches ±${Math.round(Math.asin(Math.sqrt(x)) * 180 / Math.PI)}° latitude`;
-  let html = `ΔT ${sign(warmDeltaT)} °C global — equator ${sign(eqC)} °C, poles ${sign(poleC)} °C; ${meltLine}.`;
-  if (meltVolKm3 > 0) {
-    const gelM = meltVolKm3 / SURFACE_AREA_KM2 * 1000;
-    html += `<br>Meltwater ≈ ${formatVolume(meltVolKm3)} (${gelM < 1 ? gelM.toFixed(2) : gelM.toFixed(1)} m global layer)`;
-    if (isFinite(waterLevelM)) html += ` — sea level ${Math.round(waterLevelM).toLocaleString('en-US')} m`;
+  let l2;
+  if (x <= 0) l2 = 'everything stays frozen';
+  else {
+    l2 = x >= 1 ? 'melting everywhere' : `melt to ±${Math.round(Math.asin(Math.sqrt(x)) * 180 / Math.PI)}°`;
+    if (meltVolKm3 > 0 && isFinite(waterLevelM)) {
+      l2 += ` · ${formatVolume(meltVolKm3)} · sea ${Math.round(waterLevelM).toLocaleString('en-US')} m`;
+    }
   }
-  if (ancientMode) {
-    const ancientGel = Math.round(ancientExtraKm3 / SURFACE_AREA_KM2 * 1000);
-    html += `<br>Includes the ≈${ancientGel} m global layer Mars has lost since its ocean era.`;
-  }
-  el.innerHTML = html;
+  el.innerHTML = `ΔT ${sign(warmDeltaT)} °C — equator ${sign(eqC)} °C, poles ${sign(poleC)} °C<br>${l2}`;
   document.getElementById('legend-water').style.display = isFinite(waterLevelM) ? 'block' : 'none';
 }
 

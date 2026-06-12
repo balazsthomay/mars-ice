@@ -25,11 +25,17 @@ The frontend slider melts predicted ice and floods MOLA topography. Assumptions:
   areoid-referenced MEGT grid; every cell below the level renders as water
   (equipotential fill, no flow routing). Disconnected basins fill to the same
   level.
+- Sea surface freezes over (rendered pale) where the warmed annual mean is
+  below 271 K — summer melt feeds the basins, but a standing sea's surface
+  follows the annual mean, so high-latitude seas are ice-covered until late
+  in the warming.
 - **Ancient water inventory** toggle: early Mars had ~6× today's accessible
   water (since lost to space / locked in crustal minerals). The toggle adds
-  exactly enough extra polar reservoir that a full melt reaches the
-  Deuteronilus paleo-shoreline at −3,792 m (~128 m global-equivalent total) —
-  the classic northern-ocean picture.
+  exactly enough water that a full melt reaches the Deuteronilus
+  paleo-shoreline at −3,792 m (~128 m global-equivalent total) — the classic
+  northern-ocean picture. Released in proportion to overall melt progress
+  (it returns as precipitation, not as a polar slab), so it ramps in smoothly
+  from the first melt.
 - Elevation asset: `web/elevation_rg16.png`, 16-bit metres packed R=high/G=low
   byte (browser canvases are 8-bit/channel), decoded via `web/elevation.json`
   min/max. Exported by `modal run modal_app.py::elevation_main`.

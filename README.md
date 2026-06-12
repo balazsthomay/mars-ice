@@ -25,7 +25,8 @@ The frontend slider melts predicted ice and floods MOLA topography. Assumptions:
   areoid-referenced MEGT grid; every cell below the level renders as water
   (equipotential fill, no flow routing). Disconnected basins fill to the same
   level.
-- Sea surface freezes over (rendered pale) where the warmed annual mean is
+- Sea surface freezes over (rendered slate blue-grey, distinct from the
+  white ground-ice overlay) where the warmed annual mean is
   below 271 K — summer melt feeds the basins, but a standing sea's surface
   follows the annual mean, so high-latitude seas are ice-covered until late
   in the warming.

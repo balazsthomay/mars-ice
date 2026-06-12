@@ -176,14 +176,17 @@
       Water depth
       <div class="gradient water"></div>
       <div class="ticks"><span>shore</span><span>&ge;1.5&thinsp;km</span></div>
+      <div class="ticks" style="margin-top:3px;">
+        <span><span style="display:inline-block; width:10px; height:10px; border-radius:2px; background:rgb(142,172,192); vertical-align:-1px;"></span>
+        frozen-over sea</span>
+      </div>
     </div>
   </div>
 
   <div class="panel" id="footer">
     LightGBM on SWIM ice-consistency from MOLA topography + neutron flux.
     Shallow AUC 0.93, deep 0.83; uncertainty = ensemble disagreement.
-    Water: polar-amplified warming floods MOLA topography;
-    frozen-over seas shown pale.
+    Water: polar-amplified warming floods MOLA topography.
   </div>
 
 <script>
@@ -627,13 +630,16 @@ function rebuildWater() {
       if (depth <= 0) { d[i+3] = 0; continue; }
       const t = depth >= 1500 ? 1 : depth / 1500;
       const fz = freezeRow[(px / W) | 0];
+      // Frozen sea is a flat slate blue-grey — deliberately far from both the
+      // bright white ground-ice overlay (so "ice melts → sea arrives frozen"
+      // doesn't read as the same ice coming back) and the liquid blues.
       const r0 = 125 + (8 - 125) * t;
       const g0 = 190 + (34 - 190) * t;
       const b0 = 225 + (80 - 225) * t;
-      d[i]   = r0 + (215 - r0) * fz;
-      d[i+1] = g0 + (228 - g0) * fz;
-      d[i+2] = b0 + (238 - b0) * fz;
-      d[i+3] = (165 + 90 * t) + (235 - (165 + 90 * t)) * fz;
+      d[i]   = r0 + (142 - r0) * fz;
+      d[i+1] = g0 + (172 - g0) * fz;
+      d[i+2] = b0 + (192 - b0) * fz;
+      d[i+3] = (165 + 90 * t) + (225 - (165 + 90 * t)) * fz;
     }
   }
   waterCtx.putImageData(waterImageData, 0, 0);

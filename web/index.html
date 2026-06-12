@@ -92,6 +92,8 @@
     rgba(0,0,0,0), rgba(180,210,240,0.4), rgba(220,235,250,0.7), rgba(245,250,255,0.95), #ffffff); }
   .gradient.haze { background: linear-gradient(to right,
     rgba(0,0,0,0), rgba(80,30,90,0.4), rgba(180,60,90,0.7), rgba(245,170,80,0.95), #fff0c4); }
+  .gradient.water { background: linear-gradient(to right,
+    rgba(125,190,225,0.65), rgb(45,105,170), rgb(8,34,80)); }
   button {
     background: rgba(201, 126, 84, 0.2); color: var(--fg); border: 1px solid var(--accent);
     border-radius: 4px; padding: 4px 10px; cursor: pointer; font: inherit;
@@ -109,7 +111,8 @@
     <h1>Where might there be ice under Mars's surface?</h1>
     <div class="sub" id="title-sub">
       Bright = ice predicted. Pull the slider to hide low-confidence guesses;
-      switch bands to look deeper than 5&thinsp;m.
+      switch bands to look deeper than 5&thinsp;m. Warm the planet to melt the
+      ice and flood the lowlands.
     </div>
   </div>
 
@@ -131,7 +134,19 @@
       <button id="band-shallow" type="button" class="band-btn active" data-band="shallow" style="flex:1;">0–5&thinsp;m</button>
       <button id="band-deep" type="button" class="band-btn" data-band="deep" style="flex:1;">5&thinsp;m+</button>
     </div>
-    <div class="row" style="margin-top:10px; justify-content: space-between; gap:6px;">
+    <div class="row" style="font-size:12px; color:#b8b0a4; margin-bottom:4px; margin-top:10px;">
+      Warm the planet
+    </div>
+    <div class="row" style="margin-top:0;">
+      <input type="range" id="warming" min="0" max="120" step="1" value="0" style="flex:1; accent-color: var(--accent);" />
+    </div>
+    <div class="row" style="font-size:11px; color:#9c958a; justify-content:space-between; margin-top:-4px;">
+      <span>today</span>
+      <span>+120&thinsp;&deg;C</span>
+    </div>
+    <div class="row" id="climate-readout" style="font-size:11px; color:#b8b0a4; line-height:1.45; margin-top:2px; display:block;">
+      &Delta;T +0&thinsp;&deg;C &mdash; equator &minus;58&thinsp;&deg;C; everything stays frozen.
+    </div>
       <label style="font-size:12px;">
         <input type="checkbox" id="show-landmarks" checked />
         Landmarks
@@ -148,6 +163,11 @@
       <div class="gradient ice"></div>
       <div class="ticks"><span>none / unsure</span><span>likely</span><span>confident</span></div>
     </div>
+    <div id="legend-water" style="display:none; margin-top:8px;">
+      Water depth
+      <div class="gradient water"></div>
+      <div class="ticks"><span>shore</span><span>&ge;1.5&thinsp;km</span></div>
+    </div>
   </div>
 
   <div class="panel" id="footer">
@@ -155,6 +175,8 @@
     <b>Shallow:</b> AUC 0.93 / Brier 0.08 vs 1,356 hard labels.
     <b>Deep:</b> AUC 0.83 / Brier 0.03, SWIM-block holdout.
     Uncertainty = ensemble disagreement.
+    Water sim: latitude-mean melt over MOLA topography; polar caps
+    &asymp;1.2&thinsp;km over |lat|&gt;80&deg;; assumes a thick atmosphere.
   </div>
 
 <script>
@@ -233,6 +255,58 @@ const bands = {
 let currentBand = 'shallow';
 let predCanvas = null, predCtx = null, predImageData = null;
 
+// Probability threshold: pixels below this are fully transparent so Mars shows
+// through. Without it, the soft prob^k curve smears low-probability cyan over
+// the whole globe and reads as "the planet is hazy" instead of "ice is here".
+// 0.15 is below SWIM's "low" confidence floor so we don't kill any pixel that
+// the model actually predicts as ice. Shared with the meltwater volume sums so
+// the water budget counts exactly the ice the overlay shows.
+const P_FLOOR = 0.15;
+const P_FLOOR_8 = Math.round(P_FLOOR * 255);
+
+// --- Climate / water simulation ---
+// Zonal annual-mean surface temperature, T(lat) = T_EQ - T_DROP * sin^2(lat):
+// ~215 K at the equator, ~160 K at the poles. The warming slider adds a flat
+// ΔT; ice melts where the warmed mean crosses 273.15 K, so melting sweeps from
+// the equator toward the poles. Deep ice (5 m+) is insulated and needs an
+// extra DEEP_LAG_K of warming. All of this ignores pressure (we assume a
+// thickened atmosphere, stated in the footer) — it's a what-if toy, not GCM.
+const MARS_R_KM = 3389.5;
+const SURFACE_AREA_KM2 = 4 * Math.PI * MARS_R_KM * MARS_R_KM; // ≈1.444e8
+const T_EQ_K = 215, T_DROP_K = 55;
+const MELT_K = 273.15;
+const MELT_SOFT_K = 5;       // smooth 0→1 melt over this band, no hard pixel rows
+const DEEP_LAG_K = 15;
+const CAP_LAT_DEG = 80;
+const CAP_THICKNESS_KM = 1.2;     // polar layered deposits, both caps
+const SHALLOW_THICKNESS_KM = 4 / 1000;  // assumed max ice column in 0–5 m band
+const DEEP_THICKNESS_KM = 20 / 1000;    // conservative column for the 5 m+ band
+
+let warmDeltaT = 0;
+let elevData = null;              // Float32Array H*W, metres, areoid-referenced
+let elevH = 0, elevW = 0;
+let hypsoLevelsM = null, hypsoVolKm3 = null;  // cumulative flood volume vs level
+let rowVolShallow = null, rowVolDeep = null, rowVolCap = null; // km³ ice per row
+let surviveRow = null;            // per-row fraction of ice NOT melted (current band)
+let waterLevelM = -Infinity;
+let waterCanvas = null, waterCtx = null, waterImageData = null;
+
+function rowLatDeg(row, H) { return 90 - (row + 0.5) * 180 / H; }
+function cellAreaKm2(latDeg, H, W) {
+  return MARS_R_KM * MARS_R_KM * (2 * Math.PI / W) * (Math.PI / H) * Math.cos(latDeg * Math.PI / 180);
+}
+// Fraction of ice melted at this latitude for the given warming, smoothstepped
+// over MELT_SOFT_K above the melting point. lagK shifts the threshold for ice
+// that takes more warming to reach (deep band).
+function meltFraction(latDeg, deltaT, lagK) {
+  const s = Math.sin(latDeg * Math.PI / 180);
+  const T = T_EQ_K - T_DROP_K * s * s + deltaT;
+  const t = (T - (MELT_K + lagK)) / MELT_SOFT_K;
+  if (t <= 0) return 0;
+  if (t >= 1) return 1;
+  return t * t * (3 - 2 * t);
+}
+
 function _buildCDF(uncData) {
   const hist = new Uint32Array(256);
   for (let i = 0; i < uncData.length; i += 4) hist[uncData[i]]++;
@@ -289,16 +363,16 @@ function rebuildPrediction() {
   const d = predImageData.data;
   const probData = band.probData;
   const uncData = band.uncData;
-  // Probability threshold: pixels below this are fully transparent so Mars shows
-  // through. Without it, the soft prob^k curve smears low-probability cyan over
-  // the whole globe and reads as "the planet is hazy" instead of "ice is here".
-  // 0.15 is below SWIM's "low" confidence floor so we don't kill any pixel that
-  // the model actually predicts as ice.
-  const P_FLOOR = 0.15;
-  const P_FLOOR_8 = Math.round(P_FLOOR * 255);
-  for (let i = 0; i < d.length; i += 4) {
+  // Per-row melt survival for the displayed band (1 = intact, 0 = melted away).
+  const H = predCanvas.height, W = predCanvas.width;
+  const lag = currentBand === 'deep' ? DEEP_LAG_K : 0;
+  if (!surviveRow || surviveRow.length !== H) surviveRow = new Float32Array(H);
+  for (let r = 0; r < H; r++) surviveRow[r] = 1 - meltFraction(rowLatDeg(r, H), warmDeltaT, lag);
+  let px = 0;
+  for (let i = 0; i < d.length; i += 4, px++) {
     const p8 = probData[i];
-    if (p8 < P_FLOOR_8) {
+    const surv = surviveRow[(px / W) | 0];
+    if (p8 < P_FLOOR_8 || surv < 0.004) {
       d[i+3] = 0;
       continue;
     }
@@ -318,13 +392,164 @@ function rebuildPrediction() {
     // Remap p in [P_FLOOR, 1] to [0, 1] before the gamma so the visible range
     // covers full alpha smoothly instead of starting at the threshold value.
     const p = (p8 / 255 - P_FLOOR) / (1 - P_FLOOR);
-    const sig = Math.pow(p, 1.15) * visible;
+    const sig = Math.pow(p, 1.15) * visible * surv;
     d[i]   = 220;
     d[i+1] = 240;
     d[i+2] = 255;
     d[i+3] = Math.round(sig * 245);
   }
   predCtx.putImageData(predImageData, 0, 0);
+}
+
+// Decode the elevation PNG: 16-bit metres packed as R=high byte, G=low byte
+// (a true 16-bit grayscale PNG would be quantized to 8 bits by the canvas).
+// Opaque RGB, so getImageData returns exact bytes — no premultiply loss.
+function ingestElevation(img, meta) {
+  const data = imageToData(img).data;
+  elevH = img.height; elevW = img.width;
+  const range = meta.max_m - meta.min_m;
+  elevData = new Float32Array(elevH * elevW);
+  for (let px = 0, i = 0; px < elevData.length; px++, i += 4) {
+    elevData[px] = meta.min_m + (data[i] * 256 + data[i+1]) / 65535 * range;
+  }
+  buildHypsometry(meta.min_m, meta.max_m);
+}
+
+// Hypsometric curve: cumulative flooded volume as a function of water level.
+// V(L) = ∫ area(elev < z) dz from the lowest point up to L. Precomputed once
+// over 2048 level bins; levelForVolume inverts it per slider move.
+function buildHypsometry(minM, maxM) {
+  const NB = 2048;
+  const binM = (maxM - minM) / NB;
+  const areaBelow = new Float64Array(NB + 1);
+  for (let r = 0; r < elevH; r++) {
+    const a = cellAreaKm2(rowLatDeg(r, elevH), elevH, elevW);
+    const base = r * elevW;
+    for (let c = 0; c < elevW; c++) {
+      let b = ((elevData[base + c] - minM) / binM) | 0;
+      if (b > NB - 1) b = NB - 1;
+      areaBelow[b + 1] += a;
+    }
+  }
+  for (let k = 1; k <= NB; k++) areaBelow[k] += areaBelow[k - 1];
+  hypsoLevelsM = new Float64Array(NB + 1);
+  hypsoVolKm3 = new Float64Array(NB + 1);
+  for (let k = 0; k <= NB; k++) hypsoLevelsM[k] = minM + k * binM;
+  for (let k = 1; k <= NB; k++) {
+    hypsoVolKm3[k] = hypsoVolKm3[k - 1] + areaBelow[k] * (binM / 1000);
+  }
+}
+
+function levelForVolume(volKm3) {
+  if (!hypsoVolKm3 || volKm3 <= 0) return -Infinity;
+  const n = hypsoVolKm3.length;
+  if (volKm3 >= hypsoVolKm3[n - 1]) return hypsoLevelsM[n - 1];
+  let lo = 0, hi = n - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (hypsoVolKm3[mid] <= volKm3) lo = mid; else hi = mid;
+  }
+  const f = (volKm3 - hypsoVolKm3[lo]) / (hypsoVolKm3[hi] - hypsoVolKm3[lo] || 1);
+  return hypsoLevelsM[lo] + f * (hypsoLevelsM[hi] - hypsoLevelsM[lo]);
+}
+
+// Ice inventory per latitude row, in km³ of meltwater. Probability is treated
+// as expected ice fraction of the assumed column. The polar layered deposits
+// (the real water reservoir, ~19 m global-equivalent) are a flat slab poleward
+// of ±80° — the model rasters can't see their kilometre-scale thickness.
+function buildRowIceVolumes() {
+  const H = elevH, W = elevW;
+  rowVolShallow = new Float64Array(H);
+  rowVolDeep = new Float64Array(H);
+  rowVolCap = new Float64Array(H);
+  const ps = bands.shallow.probData, pd = bands.deep.probData;
+  for (let r = 0; r < H; r++) {
+    const lat = rowLatDeg(r, H);
+    const a = cellAreaKm2(lat, H, W);
+    let ss = 0, sd = 0;
+    const base = r * W * 4;
+    for (let c = 0; c < W; c++) {
+      const i = base + c * 4;
+      if (ps[i] >= P_FLOOR_8) ss += ps[i] / 255;
+      if (pd[i] >= P_FLOOR_8) sd += pd[i] / 255;
+    }
+    rowVolShallow[r] = ss * SHALLOW_THICKNESS_KM * a;
+    rowVolDeep[r] = sd * DEEP_THICKNESS_KM * a;
+    if (Math.abs(lat) > CAP_LAT_DEG) rowVolCap[r] = W * a * CAP_THICKNESS_KM;
+  }
+}
+
+// Total meltwater at the current warming. Both bands and the caps contribute
+// regardless of which band is displayed — the ocean shouldn't change when you
+// flip the depth toggle.
+function computeMeltVolumeKm3() {
+  if (!rowVolShallow) return 0;
+  let v = 0;
+  for (let r = 0; r < rowVolShallow.length; r++) {
+    const lat = rowLatDeg(r, rowVolShallow.length);
+    const mfS = meltFraction(lat, warmDeltaT, 0);
+    if (mfS > 0) v += (rowVolShallow[r] + rowVolCap[r]) * mfS;
+    const mfD = meltFraction(lat, warmDeltaT, DEEP_LAG_K);
+    if (mfD > 0) v += rowVolDeep[r] * mfD;
+  }
+  return v;
+}
+
+function initWaterCanvas(W, H) {
+  waterCanvas = document.createElement('canvas');
+  waterCanvas.width = W; waterCanvas.height = H;
+  waterCtx = waterCanvas.getContext('2d');
+  waterImageData = waterCtx.createImageData(W, H);
+}
+
+// Equipotential fill: every cell whose (areoid-referenced) elevation sits below
+// the water level is flooded, colour graded by depth. Disconnected basins
+// (Hellas vs the northern lowlands) fill independently at the same level,
+// which is the equilibrium answer without simulating flow.
+function rebuildWater() {
+  if (!elevData || !waterImageData) return;
+  const d = waterImageData.data;
+  const lvl = waterLevelM;
+  if (!isFinite(lvl)) {
+    d.fill(0);
+  } else {
+    for (let px = 0, i = 0; px < elevData.length; px++, i += 4) {
+      const depth = lvl - elevData[px];
+      if (depth <= 0) { d[i+3] = 0; continue; }
+      const t = depth >= 1500 ? 1 : depth / 1500;
+      d[i]   = 125 + (8 - 125) * t;
+      d[i+1] = 190 + (34 - 190) * t;
+      d[i+2] = 225 + (80 - 225) * t;
+      d[i+3] = 165 + 90 * t;
+    }
+  }
+  waterCtx.putImageData(waterImageData, 0, 0);
+}
+
+function formatVolume(volKm3) {
+  if (volKm3 >= 1e6) return (volKm3 / 1e6).toFixed(2) + 'M km³';
+  if (volKm3 >= 1e3) return Math.round(volKm3 / 1e3) + 'k km³';
+  return Math.round(volKm3) + ' km³';
+}
+
+function updateClimateReadout(meltVolKm3) {
+  const el = document.getElementById('climate-readout');
+  const eqC = Math.round(T_EQ_K + warmDeltaT - MELT_K);
+  const sign = v => (v >= 0 ? '+' : '−') + Math.abs(v);
+  // Latitude where the warmed zonal mean crosses the melting point
+  const x = (T_EQ_K + warmDeltaT - MELT_K) / T_DROP_K;
+  let meltLine;
+  if (x <= 0) meltLine = 'everything stays frozen';
+  else if (x >= 1) meltLine = 'melting at every latitude';
+  else meltLine = `ice melts up to ±${Math.round(Math.asin(Math.sqrt(x)) * 180 / Math.PI)}° latitude`;
+  let html = `ΔT ${sign(warmDeltaT)} °C — equator ${sign(eqC)} °C; ${meltLine}.`;
+  if (meltVolKm3 > 0) {
+    const gelM = meltVolKm3 / SURFACE_AREA_KM2 * 1000;
+    html += `<br>Meltwater ≈ ${formatVolume(meltVolKm3)} (${gelM < 1 ? gelM.toFixed(2) : gelM.toFixed(1)} m global layer)`;
+    if (isFinite(waterLevelM)) html += ` — sea level ${Math.round(waterLevelM).toLocaleString('en-US')} m`;
+  }
+  el.innerHTML = html;
+  document.getElementById('legend-water').style.display = isFinite(waterLevelM) ? 'block' : 'none';
 }
 
 const overlayCanvases = {};
@@ -365,21 +590,28 @@ function tick(ts) {
 requestAnimationFrame(tick);
 
 (async () => {
-  const [marsImg, probShallow, uncShallow, probDeep, uncDeep] = await Promise.all([
+  const [marsImg, probShallow, uncShallow, probDeep, uncDeep, elevImg, elevMeta] = await Promise.all([
     loadImage('./mars_4k.jpg'),
     loadImage('./shallow_probability_8bit.png'),
     loadImage('./shallow_uncertainty_8bit.png'),
     loadImage('./deep_probability_8bit.png'),
     loadImage('./deep_uncertainty_8bit.png'),
+    loadImage('./elevation_rg16.png'),
+    fetch('./elevation.json').then(r => r.json()),
   ]);
   overlayCanvases.mars = marsImg;
   ingestBand('shallow', probShallow, uncShallow);
   ingestBand('deep', probDeep, uncDeep);
   initPredictionCanvas(probShallow.width, probShallow.height);
+  ingestElevation(elevImg, elevMeta);
+  buildRowIceVolumes();
+  initWaterCanvas(elevImg.width, elevImg.height);
+  rebuildWater();
   refresh();
 })();
 
 let predRevision = 0;
+let waterRevision = 0;
 function buildLayers() {
   if (!overlayCanvases.mars || !predCanvas) return [];
   const layers = [
@@ -406,6 +638,20 @@ function buildLayers() {
       parameters: { depthCompare: 'less-equal' }
     }),
   ];
+  if (waterCanvas) {
+    layers.push(new BitmapLayer({
+      // Same in-place-mutation story as the prediction canvas: bump the id so
+      // deck.gl re-uploads the texture after rebuildWater().
+      id: 'water-' + waterRevision,
+      bounds: MARS_BOUNDS,
+      image: waterCanvas,
+      opacity: 1,
+      _imageCoordinateSystem: COORDINATE_SYSTEM.LNGLAT,
+      // Drawn after prediction so standing water covers any surviving ice
+      // pixels below the waterline.
+      parameters: { depthCompare: 'less-equal' }
+    }));
+  }
   if (showLandmarks) {
     layers.push(new ScatterplotLayer({
       id: 'landmark-pins',
@@ -452,9 +698,12 @@ function refresh() { deckInstance.setProps({layers: buildLayers()}); }
 // frame at most, and a min interval guarantees the previous rebuild has had
 // time to finish before we kick off the next.
 let pendingRebuild = false;
+let waterDirty = false;
 let lastRebuildAt = 0;
 const MIN_REBUILD_INTERVAL_MS = 50;
-function scheduleRebuild() {
+function scheduleRebuild(opts) {
+  // Water only changes with warming; confidence/band moves skip its 9M-pixel loop.
+  if (opts && opts.water) waterDirty = true;
   if (pendingRebuild) return;
   pendingRebuild = true;
   const elapsed = performance.now() - lastRebuildAt;
@@ -464,6 +713,11 @@ function scheduleRebuild() {
     lastRebuildAt = performance.now();
     rebuildPrediction();
     predRevision++;
+    if (waterDirty) {
+      waterDirty = false;
+      rebuildWater();
+      waterRevision++;
+    }
     refresh();
   });
   if (delay > 0) setTimeout(fire, delay); else fire();
@@ -471,6 +725,13 @@ function scheduleRebuild() {
 document.getElementById('confidence').addEventListener('input', e => {
   confidenceFilter = parseFloat(e.target.value);
   scheduleRebuild();
+});
+document.getElementById('warming').addEventListener('input', e => {
+  warmDeltaT = parseInt(e.target.value, 10);
+  const meltVol = computeMeltVolumeKm3();
+  waterLevelM = levelForVolume(meltVol);
+  updateClimateReadout(meltVol);
+  scheduleRebuild({water: true});
 });
 document.querySelectorAll('.band-btn').forEach(btn => {
   btn.addEventListener('click', e => {

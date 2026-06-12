@@ -1699,6 +1699,88 @@ def fetch_tiles(out_dir: str = "tiles_local", include_deep: bool = True):
             print(f"  SKIP {name}: {str(e)[:120]}")
 
 
+@app.function(image=image.pip_install("Pillow>=10"), volumes={DATA_DIR: volume}, timeout=600)
+def export_elevation() -> dict:
+    """Encode MOLA topography from the feature stack as a web-ready PNG.
+
+    Browser canvases are 8 bits per channel, so a true 16-bit grayscale PNG
+    would be silently quantized to 8 bits on decode. Instead the 16-bit value
+    is split across two channels: R = high byte, G = low byte, B = 0.
+    JS decodes elev_m = min_m + (R*256 + G)/65535 * (max_m - min_m).
+
+    MEGT is areoid-referenced topography, so an equipotential water surface is
+    simply elev_m < level — no further gravity correction needed for flooding.
+    """
+    import json
+    import time
+
+    import numpy as np
+    from PIL import Image
+
+    out_dir = pathlib.Path(TILES_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    arr = np.load(pathlib.Path(PROCESSED) / "feature_stack.npz")
+    topo = arr["mola_topography_m"].astype("float64")
+    H, W = topo.shape
+
+    # Roll to lon=[-180, 180] to match the prediction tiles (stack is 0..360)
+    half = W // 2
+    topo = np.concatenate([topo[:, half:], topo[:, :half]], axis=1)
+
+    valid = np.isfinite(topo)
+    tmin = float(np.nanmin(topo))
+    tmax = float(np.nanmax(topo))
+    scaled = np.clip((np.where(valid, topo, tmin) - tmin) / (tmax - tmin), 0.0, 1.0)
+    v16 = np.round(scaled * 65535).astype("uint16")
+
+    rgb = np.zeros((H, W, 3), dtype="uint8")
+    rgb[..., 0] = (v16 >> 8).astype("uint8")
+    rgb[..., 1] = (v16 & 0xFF).astype("uint8")
+
+    t0 = time.time()
+    png_path = out_dir / "elevation_rg16.png"
+    Image.fromarray(rgb).save(png_path, optimize=True)
+
+    meta = {
+        "file": "elevation_rg16.png",
+        "min_m": tmin,
+        "max_m": tmax,
+        "shape": [H, W],
+        "bounds_lonlat": [-180.0, -90.0, 180.0, 90.0],
+        "crs": TARGET_CRS,
+        "encoding": "elev_m = min_m + (R*256 + G)/65535 * (max_m - min_m); areoid-referenced (MEGT)",
+        "source": "MOLA MEGDR megt90n000eb (16 px/deg) regridded to feature stack grid",
+    }
+    meta_path = out_dir / "elevation.json"
+    meta_path.write_text(json.dumps(meta, indent=2))
+
+    volume.commit()
+    return {
+        "png_mb": round(png_path.stat().st_size / 1024 / 1024, 3),
+        "min_m": tmin,
+        "max_m": tmax,
+        "shape": [H, W],
+        "elapsed_s": round(time.time() - t0, 1),
+    }
+
+
+@app.local_entrypoint()
+def elevation_main(out_dir: str = "web"):
+    """Export the elevation PNG on Modal and download it into web/."""
+    import json
+    import pathlib as plib
+
+    res = export_elevation.remote()
+    print(json.dumps(res, indent=2))
+    target = plib.Path(out_dir)
+    target.mkdir(parents=True, exist_ok=True)
+    for name in ["elevation_rg16.png", "elevation.json"]:
+        b = get_tile_bytes.remote(name)
+        (target / name).write_bytes(b)
+        print(f"  {name}: {len(b)} bytes -> {target / name}")
+
+
 @app.local_entrypoint()
 def train_main():
     import json

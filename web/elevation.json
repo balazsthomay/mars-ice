@@ -1,0 +1,18 @@
+{
+  "file": "elevation_rg16.png",
+  "min_m": -8147.44921875,
+  "max_m": 21147.86328125,
+  "shape": [
+    2160,
+    4320
+  ],
+  "bounds_lonlat": [
+    -180.0,
+    -90.0,
+    180.0,
+    90.0
+  ],
+  "crs": "IAU_2015:49900",
+  "encoding": "elev_m = min_m + (R*256 + G)/65535 * (max_m - min_m); areoid-referenced (MEGT)",
+  "source": "MOLA MEGDR megt90n000eb (16 px/deg) regridded to feature stack grid"
+}

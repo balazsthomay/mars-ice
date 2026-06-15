@@ -114,7 +114,7 @@
     <h1>Where might there be ice under Mars's surface?</h1>
     <div class="sub" id="title-sub">
       Bright = predicted ice. Slide to hide low-confidence guesses;
-      warm the planet to melt ice and flood the lowlands.
+      thicken the atmosphere to warm Mars and flood the lowlands.
     </div>
   </div>
 
@@ -137,17 +137,17 @@
       <button id="band-deep" type="button" class="band-btn" data-band="deep" style="flex:1;">5&thinsp;m+</button>
     </div>
     <div class="row" style="font-size:12px; color:#b8b0a4; margin-bottom:4px; margin-top:10px;">
-      Warm the planet
+      Thicken the atmosphere
     </div>
     <div class="row" style="margin-top:0;">
-      <input type="range" id="warming" min="0" max="80" step="1" value="0" style="flex:1; accent-color: var(--accent);" />
+      <input type="range" id="pressure" min="0" max="100" step="1" value="0" style="flex:1; accent-color: var(--accent);" />
     </div>
     <div class="row" style="font-size:11px; color:#9c958a; justify-content:space-between; margin-top:-4px;">
-      <span>today</span>
-      <span>+80&thinsp;&deg;C global</span>
+      <span>today &middot; 6&thinsp;mbar</span>
+      <span>2&thinsp;bar</span>
     </div>
     <div class="row" id="climate-readout" style="font-size:11px; color:#b8b0a4; line-height:1.45; margin-top:2px; display:block;">
-      &Delta;T +0&thinsp;&deg;C &mdash; equator &minus;58&thinsp;&deg;C, poles &minus;113&thinsp;&deg;C<br>everything stays frozen
+      &Delta;T +0&thinsp;&deg;C &middot; 6&thinsp;mbar &mdash; equator &minus;58&thinsp;&deg;C, poles &minus;113&thinsp;&deg;C<br>everything stays frozen
     </div>
     <div class="row" style="margin-top:6px;">
       <label style="font-size:12px;" title="Adds the water Mars lost to space and crustal minerals since ~3.5 Ga — enough to refill the mapped ancient shoreline">
@@ -186,7 +186,8 @@
   <div class="panel" id="footer">
     LightGBM on SWIM ice-consistency from MOLA topography + neutron flux.
     Shallow AUC 0.93, deep 0.83; uncertainty = ensemble disagreement.
-    Water: polar-amplified warming floods MOLA topography.
+    Water: a thicker atmosphere warms the planet and lifts pressure past the
+    triple point so meltwater floods MOLA topography instead of subliming.
   </div>
 
 <script>
@@ -285,8 +286,9 @@ const P_FLOOR_8 = Math.round(P_FLOOR * 255);
 // crosses MELT_ONSET_K = 252 K, not 273: sustained summer melt starts well
 // below freezing annual means (Greenland's ablation zone sits at −10…−20 °C),
 // so melting sweeps equator → poles over ΔT_g ≈ +46…+66 °C. Deep ice (5 m+)
-// is insulated and lags by DEEP_LAG_K. Pressure is ignored (we assume a
-// thickened atmosphere, stated in the footer) — it's a what-if toy, not a GCM.
+// is insulated and lags by DEEP_LAG_K.
+// Warming is driven entirely by the pressure slider (see below) — ΔT_g is the
+// greenhouse warming a thicker atmosphere produces.
 const MARS_R_KM = 3389.5;
 const SURFACE_AREA_KM2 = 4 * Math.PI * MARS_R_KM * MARS_R_KM; // ≈1.444e8
 const T_EQ_K = 215, T_DROP_K = 55;
@@ -300,6 +302,22 @@ const MELT_SOFT_K = 5;       // smooth 0→1 melt over this band, no hard pixel 
 const SEA_FREEZE_K = 271;
 const SEA_FREEZE_SOFT_K = 6;
 const DEEP_LAG_K = 15;
+// Atmospheric pressure (bar) is the ONLY climate knob: thickening the
+// atmosphere is the only way to warm the planet here, so temperature is a pure
+// function of pressure and you can't get heat without also raising pressure —
+// which is why the triple-point problem (warm air at near-vacuum melting ice
+// that would only sublimate) can't arise. Today ≈ 6 mbar; the slider tops out
+// at a thick 2-bar atmosphere. TRIPLE_POINT_BAR is the hard floor below which
+// liquid water cannot exist at any temperature (ice sublimates). GH_PER_LN sets
+// the greenhouse strength: ΔT_gh = GH_PER_LN · ln(P / P_present). It is
+// calibrated (≈+93 K at 2 bar) so the slider spans frozen → flooded; a real
+// CO2-only greenhouse is weaker (~+40 K at 2 bar and Mars stays frozen), so
+// this implicitly assumes extra greenhouse gases — the warming many paleo-Mars
+// GCMs need to reach the melting point. It's a what-if toy, not a GCM.
+const P_PRESENT_BAR = 0.006;
+const P_MAX_BAR = 2.0;
+const TRIPLE_POINT_BAR = 0.00611;
+const GH_PER_LN = 16;
 // Polar reservoir: layered deposits + circumpolar ground ice, ~5×10⁶ km³
 // (≈33 m global-equivalent — the dominant inventory). Approximated as a flat
 // slab poleward of ±78°. These are photographed, not model predictions, so the
@@ -322,7 +340,7 @@ const ANCIENT_SHORELINE_M = -3792;
 let ancientMode = false;
 let ancientExtraKm3 = 0;          // computed from the hypsometry at load
 
-let warmDeltaT = 0;               // global-mean warming, °C
+let pressureBar = P_PRESENT_BAR;  // surface pressure, bar — the only climate knob
 let elevData = null;              // Float32Array H*W, metres, areoid-referenced
 let elevH = 0, elevW = 0;
 let hypsoLevelsM = null, hypsoVolKm3 = null;  // cumulative flood volume vs level
@@ -338,6 +356,15 @@ let waterCanvas = null, waterCtx = null, waterImageData = null;
 function rowLatDeg(row, H) { return 90 - (row + 0.5) * 180 / H; }
 function cellAreaKm2(latDeg, H, W) {
   return MARS_R_KM * MARS_R_KM * (2 * Math.PI / W) * (Math.PI / H) * Math.cos(latDeg * Math.PI / 180);
+}
+// Greenhouse warming from a thicker atmosphere, K (0 at today's pressure).
+function greenhouseDeltaT(pBar) {
+  return Math.max(0, GH_PER_LN * Math.log(pBar / P_PRESENT_BAR));
+}
+// Total warming the physics sees — entirely the atmospheric greenhouse, since
+// pressure is the only climate knob.
+function effectiveDeltaT() {
+  return greenhouseDeltaT(pressureBar);
 }
 // Warmed zonal annual-mean temperature at a latitude, K
 function warmedTempK(latDeg, deltaTg) {
@@ -419,7 +446,8 @@ function rebuildPrediction() {
   const H = predCanvas.height, W = predCanvas.width;
   const lag = currentBand === 'deep' ? DEEP_LAG_K : 0;
   if (!surviveRow || surviveRow.length !== H) surviveRow = new Float32Array(H);
-  for (let r = 0; r < H; r++) surviveRow[r] = 1 - meltFraction(rowLatDeg(r, H), warmDeltaT, lag);
+  const dT = effectiveDeltaT();
+  for (let r = 0; r < H; r++) surviveRow[r] = 1 - meltFraction(rowLatDeg(r, H), dT, lag);
   let px = 0;
   for (let i = 0; i < d.length; i += 4, px++) {
     const p8 = probData[i];
@@ -580,17 +608,18 @@ function computeMeltVolumeKm3() {
   const H = elevH;
   const uS = uncThresholdByte('shallow');
   const uD = uncThresholdByte('deep');
+  const dT = effectiveDeltaT();
   let v = 0, vMax = 0;
   for (let r = 0; r < H; r++) {
     const lat = rowLatDeg(r, H);
     const rowS = rowVolCumShallow[r * 256 + uS];
     const rowD = rowVolCumDeep[r * 256 + uD];
     vMax += rowS + rowD + rowVolCap[r];
-    const mfS = meltFraction(lat, warmDeltaT, 0);
+    const mfS = meltFraction(lat, dT, 0);
     if (mfS > 0) v += rowS * mfS;
-    const mfD = meltFraction(lat, warmDeltaT, DEEP_LAG_K);
+    const mfD = meltFraction(lat, dT, DEEP_LAG_K);
     if (mfD > 0) v += rowD * mfD;
-    if (rowVolCap[r] > 0) v += rowVolCap[r] * capMeltFraction(lat, warmDeltaT);
+    if (rowVolCap[r] > 0) v += rowVolCap[r] * capMeltFraction(lat, dT);
   }
   // The ancient inventory is released in proportion to overall melt progress —
   // it returns as precipitation everywhere, not as a polar slab — so it ramps
@@ -621,8 +650,9 @@ function rebuildWater() {
     // Per-row sea-surface state: 0 = open water, 1 = frozen over (pale)
     const H = elevH, W = elevW;
     const freezeRow = new Float32Array(H);
+    const dT = effectiveDeltaT();
     for (let r = 0; r < H; r++) {
-      const f = (SEA_FREEZE_K - warmedTempK(rowLatDeg(r, H), warmDeltaT)) / SEA_FREEZE_SOFT_K;
+      const f = (SEA_FREEZE_K - warmedTempK(rowLatDeg(r, H), dT)) / SEA_FREEZE_SOFT_K;
       freezeRow[r] = f <= 0 ? 0 : f >= 1 ? 1 : f;
     }
     for (let px = 0, i = 0; px < elevData.length; px++, i += 4) {
@@ -651,32 +681,49 @@ function formatVolume(volKm3) {
   return Math.round(volKm3) + ' km³';
 }
 
+function formatPressure(pBar) {
+  return pBar < 1 ? `${Math.round(pBar * 1000)} mbar` : `${pBar.toFixed(1)} bar`;
+}
+
 function updateClimateReadout(meltVolKm3) {
   const el = document.getElementById('climate-readout');
   const sign = v => (v >= 0 ? '+' : '−') + Math.abs(v);
-  const eqC = Math.round(warmedTempK(0, warmDeltaT) - 273.15);
-  const poleC = Math.round(warmedTempK(90, warmDeltaT) - 273.15);
-  // Latitude where the amplified warming crosses the melt onset:
-  // sin²lat = (ONSET - T_EQ - AMP_EQ·ΔT) / (AMP_S2·ΔT - T_DROP); the denominator
-  // stays negative across the slider range, so the melt zone is equatorward.
-  const x = (MELT_ONSET_K - T_EQ_K - AMP_EQ * warmDeltaT) / (AMP_S2 * warmDeltaT - T_DROP_K);
+  const dT = effectiveDeltaT();
+  const hasLiquid = pressureBar >= TRIPLE_POINT_BAR;
+  const eqT = warmedTempK(0, dT), poleT = warmedTempK(90, dT);
+  const eqC = Math.round(eqT - 273.15);
+  const poleC = Math.round(poleT - 273.15);
+  // Decide the melt extent from the actual endpoint temperatures rather than an
+  // algebraic boundary. Polar amplification means that past ΔT ≈ T_DROP/AMP_S2
+  // the gradient flips (poles warm faster than the equator), so the onset
+  // crossing can sit on either side — checking both ends stays correct in both
+  // regimes. sin²lat at the crossing = (ONSET - T_EQ - AMP_EQ·ΔT)/(AMP_S2·ΔT - T_DROP).
+  const meltsEq = eqT >= MELT_ONSET_K, meltsPole = poleT >= MELT_ONSET_K;
   let l2;
-  if (x <= 0) l2 = 'everything stays frozen';
+  if (!meltsEq && !meltsPole) l2 = 'everything stays frozen';
+  else if (!hasLiquid) l2 = 'ice sublimates — no liquid water at this pressure';
   else {
-    l2 = x >= 1 ? 'melting everywhere' : `melt to ±${Math.round(Math.asin(Math.sqrt(x)) * 180 / Math.PI)}°`;
+    if (meltsEq && meltsPole) l2 = 'melting everywhere';
+    else {
+      const s2 = (MELT_ONSET_K - T_EQ_K - AMP_EQ * dT) / (AMP_S2 * dT - T_DROP_K);
+      const latB = Math.round(Math.asin(Math.sqrt(Math.min(1, Math.max(0, s2)))) * 180 / Math.PI);
+      l2 = meltsEq ? `melt to ±${latB}°` : `melt poleward of ±${latB}°`;
+    }
     if (meltVolKm3 > 0 && isFinite(waterLevelM)) {
-      l2 += ` · ${formatVolume(meltVolKm3)} · sea ${Math.round(waterLevelM).toLocaleString('en-US')} m`;
+      l2 += ` · ${formatVolume(meltVolKm3)} · sea ${Math.round(waterLevelM).toLocaleString('en-US')} m`;
     }
   }
-  el.innerHTML = `ΔT ${sign(warmDeltaT)} °C — equator ${sign(eqC)} °C, poles ${sign(poleC)} °C<br>${l2}`;
+  el.innerHTML = `ΔT ${sign(Math.round(dT))} °C · ${formatPressure(pressureBar)} — equator ${sign(eqC)} °C, poles ${sign(poleC)} °C<br>${l2}`;
   document.getElementById('legend-water').style.display = isFinite(waterLevelM) ? 'block' : 'none';
 }
 
-// Recompute the water budget whenever warming, confidence, or the ancient
-// toggle changes — all three feed computeMeltVolumeKm3.
+// Recompute the water budget whenever pressure, confidence, or the
+// ancient toggle changes — they all feed computeMeltVolumeKm3 / the pressure
+// gate. Below the triple point liquid water can't exist: melt sublimates and
+// no ocean accumulates, so there's no sea surface to draw.
 function updateWaterFromClimate() {
   const meltVol = computeMeltVolumeKm3();
-  waterLevelM = levelForVolume(meltVol);
+  waterLevelM = pressureBar < TRIPLE_POINT_BAR ? -Infinity : levelForVolume(meltVol);
   updateClimateReadout(meltVol);
 }
 
@@ -830,7 +877,7 @@ let waterDirty = false;
 let lastRebuildAt = 0;
 const MIN_REBUILD_INTERVAL_MS = 50;
 function scheduleRebuild(opts) {
-  // Water only changes with warming; confidence/band moves skip its 9M-pixel loop.
+  // Water only changes with pressure; confidence/band moves skip its 9M-pixel loop.
   if (opts && opts.water) waterDirty = true;
   if (pendingRebuild) return;
   pendingRebuild = true;
@@ -858,8 +905,10 @@ document.getElementById('confidence').addEventListener('input', e => {
   updateWaterFromClimate();
   scheduleRebuild({water: true});
 });
-document.getElementById('warming').addEventListener('input', e => {
-  warmDeltaT = parseInt(e.target.value, 10);
+document.getElementById('pressure').addEventListener('input', e => {
+  // Slider 0–100 maps logarithmically to pressure, 6 mbar → 2 bar.
+  const v = parseInt(e.target.value, 10);
+  pressureBar = P_PRESENT_BAR * Math.pow(P_MAX_BAR / P_PRESENT_BAR, v / 100);
   updateWaterFromClimate();
   scheduleRebuild({water: true});
 });
